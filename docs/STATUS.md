@@ -53,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 153 off-device tool tests — all passing.**
+**302 JVM tests, 15 Dart tests, 145 native checks (41 of them need an NDK and skip without one), 156 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1756,6 +1756,43 @@ What the next run has to show, in order: no tombstone, then
 whether `ApkAddCentralDirectory` is gone. If it is not, that line and the
 `nothing in this process imports` line beside it name the missing symbol outright, which is
 the first time this fault will have been answerable without another guess.
+
+### The twenty-second run: the loader fix holds, and the engine is still not redirected
+
+Everything runs 20 and 21 were missing is in this log:
+
+```
+io_redirect: linker dlopen located; dlopen is hooked with the caller preserved
+io_redirect: hooked 1 new slot(s) after loading …/lib/arm64-v8a/libunity.so
+io_redirect: hooked libunity.so=2
+```
+
+No tombstone, so the namespace is preserved and the game loads its engine. A rescan fired
+on the load, so the hook sees it. `libunity.so` was scanned. Both ends of the `dlopen`
+problem are closed and the shape that closed them — calling `__loader_dlopen` with the
+caller's own return address — is the one `dlopen` itself has.
+
+**And the engine still cannot open the APK.** `libunity.so=2`: out of thirty-eight names in
+the redirect table, Unity's engine imports two, and the log does not say which two or what
+else it asks libc for. That has been the state of this fault for four runs, and it is the
+reason each round has ended in a guess about how Unity opens a file.
+
+So the scan now reports the names, for the guest's own libraries only:
+
+```
+io_redirect: symbols libunity.so patched=<names> unhooked=<file operations it imports
+             that the table does not have>
+```
+
+Both halves come out of a walk that was already happening — the relocation being examined
+carries the symbol name — and the second half is the one that matters: a file operation
+`libunity.so` imports and UNIQUE does not hook is, by elimination, the call that opens the
+APK. The next log answers it outright instead of narrowing it.
+
+Three names were added on the way, from a diff of the table against bionic's own exported
+path-taking functions rather than from a guess about Unity: `freopen`, `freopen64` — which
+open a path outright — and `statx`, the modern `stat` a recent libc++ `std::filesystem`
+reaches for. `tools/native-test/check_libc_symbols.py` covers all forty-one.
 
 ### Signing in: the refusal happens before the account picker, and that is measurable
 

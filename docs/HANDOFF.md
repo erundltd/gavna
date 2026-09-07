@@ -60,7 +60,7 @@ exist because a claim was made without evidence and a later phone log contradict
 - `/proc/self/maps` inside a guest no longer names UNIQUE — `PROC_VIEW_INSTALLED …
   named=16 leaked=0` on the phone, and the graft checks its own work.
 - Two instances of one app have separate identities, storage and `ANDROID_ID`.
-- 302 JVM tests, 142 host-side native checks, 136 device-log tests, 17 APK-survey tests, 15
+- 302 JVM tests, 145 host-side native checks, 139 device-log tests, 17 APK-survey tests, 15
   Dart tests. All passing.
 
 ### Does not work
@@ -90,9 +90,9 @@ The NDK is installed by Gradle on first native build. AGP 8.13.0, Kotlin 2.2.20.
 
 ```bash
 ./gradlew test                    # 302 JVM tests
-./tools/native-test/run.sh        # 142 native checks; 38 need an NDK and skip without one
+./tools/native-test/run.sh        # 145 native checks; 41 need an NDK and skip without one
 (cd ui && flutter test)           # 15 Dart tests
-./tools/device-log/self_test.py   # 136 tests for the log analyzer, no toolchain
+./tools/device-log/self_test.py   # 139 tests for the log analyzer, no toolchain
 ./tools/apk-survey/self_test.py   # 17 tests
 ./tools/check-translations.py     # every engine failure has both languages
 ./tools/report-unimplemented.sh   # every deliberately unimplemented surface
@@ -341,7 +341,8 @@ This is where most of the recent work happened and where the next bug will proba
 | + `__open_2`, the re-armed load watch | 19 | Sentry and Conscrypt hooked for the first time; `libunity.so` never loaded, so the fault it was for is still unanswered. **WebView's renderer** was handed the published *data* path, could not create a directory under it, and trapped |
 | + `libwebviewchromium.so` and the Trichrome names | 19 | untested |
 | − the plain `dlopen` hook | 20 | the game died in `UnityPlayer.loadNative`: hooking `dlopen` moves the *caller* and therefore the linker namespace, so a bare soname stops resolving. A regression from the run-18 watch re-arm, and it was in run 19 too |
-| + `dlopen` again, through `__loader_dlopen` with the caller preserved | 21 | without the hook nothing notices `libmain.so` loading `libunity.so`, so the engine is never redirected and cannot open its own APK. Both ends of one fact; untested |
+| + `dlopen` again, through `__loader_dlopen` with the caller preserved | 21 | without the hook nothing notices `libmain.so` loading `libunity.so`, so the engine is never redirected and cannot open its own APK. Both ends of one fact |
+| — | 22 | it worked: no tombstone, a rescan on the load, `libunity.so=2`. And two of thirty-eight names is all the log said, so the scan reports the *names* now |
 
 **The lesson from run 15, which is the important one**: the safety argument ("no rule can
 match `/data/user/0/com.unique`, so a hooked library touching UNIQUE's files is unaffected")
@@ -493,7 +494,7 @@ phone run is checked in as a fixture under `tools/device-log/fixtures/` with ass
 `self_test.py`, so **a check that stops reporting a fault a real phone produced is a
 regression in the tool** rather than progress in the engine.
 
-Nineteen captures are checked in — the first run, then runs 4 through 21; runs 2 and 3
+Twenty captures are checked in — the first run, then runs 4 through 22; runs 2 and 3
 predate the analyzer and were never kept. When a new log arrives:
 
 1. run the analyzer;
@@ -508,15 +509,15 @@ predate the analyzer and were never kept. When a new log arrives:
 
 ## 8. What to do next, in order
 
-1. **The twenty-second run.** The game starts now (run 21) and cannot read its own APK,
-   which is the fault run 18 was about and the first one that is answerable without a
-   guess. In order:
-   - `io_redirect: hooked … after loading …/libunity.so`, and a `libunity.so=<n>` line.
-     Their absence means the `dlopen` hook is not installed — look for
-     `io_redirect: linker dlopen not found` — and nothing downstream matters.
-   - No `E Unity: ApkAddCentralDirectory : Unable to open`, and no "Not enough storage
-     space" dialog. If it is still there, `libunity.so=<n>` and the
-     `nothing in this process imports` line beside it name the symbol that is missing.
+1. **The twenty-third run**, and it is a measurement rather than a hope. Run 22 closed the
+   loader problem from both ends — no tombstone, a rescan on the load, `libunity.so=2` —
+   and the engine still cannot open the APK. What to read, in order:
+   - `io_redirect: symbols libunity.so patched=… unhooked=…`. The second list is the
+     answer: a file operation the engine imports that the table does not hook is, by
+     elimination, the call that opens the APK. Add it and the fault is closed.
+   - Whether `E Unity: ApkAddCentralDirectory : Unable to open` is gone anyway — `freopen`,
+     `freopen64` and `statx` went in with this build, from a diff against bionic's own
+     exports rather than a guess.
    - No `JNI FatalError … libunity.so` tombstone, which is run 20's failure returning.
    - **No `JNI FatalError … libunity.so` tombstone.** That is what the `dlopen` hook
      removal is for, and the `crash` check reads the tombstone now rather than only

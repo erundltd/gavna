@@ -58,6 +58,11 @@ struct HookReport {
     /// newest first and bounded. Which library a redirect reached is otherwise a number
     /// with no name attached to it.
     std::vector<std::string> per_library;
+    /// For the guest's own libraries only: "<library> patched=<names> unhooked=<names>".
+    /// The number in `per_library` says how much was patched; this says *what*, and what
+    /// file operations the library imports that the table does not have. Bounded to
+    /// sixteen libraries and twenty-four names each.
+    std::vector<std::string> per_library_symbols;
 };
 
 // Patches every address slot in the loaded libraries whose path contains one of

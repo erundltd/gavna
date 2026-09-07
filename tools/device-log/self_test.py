@@ -68,6 +68,8 @@ FIXTURE20 = os.path.join(HERE, "fixtures", "redmi-android15-run20.log")
 FIXTURE20_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run20.device.txt")
 FIXTURE21 = os.path.join(HERE, "fixtures", "redmi-android15-run21.log")
 FIXTURE21_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run21.device.txt")
+FIXTURE22 = os.path.join(HERE, "fixtures", "redmi-android15-run22.log")
+FIXTURE22_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run22.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -1475,6 +1477,47 @@ class RedmiRun21Test(unittest.TestCase):
     def test_google_and_paths_are_the_failing_checks(self):
         failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
         self.assertEqual(failing, ["google", "paths"])
+
+
+class RedmiRun22Test(unittest.TestCase):
+    """The twenty-second run: the loader fix works, and the engine is still not redirected.
+
+    Everything the twenty-first run was missing is here:
+
+    ```
+    io_redirect: linker dlopen located; dlopen is hooked with the caller preserved
+    io_redirect: hooked 1 new slot(s) after loading …/lib/arm64-v8a/libunity.so
+    io_redirect: hooked libunity.so=2
+    ```
+
+    No tombstone, so the namespace is preserved; a rescan fired on the load, so the hook is
+    seeing it; and `libunity.so` was scanned. Both ends of run 20 and run 21 are closed.
+
+    And the engine still cannot open the APK. `libunity.so=2` is the whole of what the log
+    says about why — the engine matched two of the table's thirty-eight names and the log
+    does not say which two, or what else it asks libc for. That is what the `symbols` line
+    added after this run reports, and this fixture is the last log in which the question
+    could not be answered.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE22, FIXTURE22_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_the_engine_loaded_and_did_not_take_the_game_down(self):
+        self.assertEqual(self.checks["crash"].verdict, analyze.PASS)
+
+    def test_the_published_apk_is_still_unopenable_by_the_engine(self):
+        detail = findings(self.checks["paths"])
+        self.assertIn("did not resolve for Unity", detail)
+
+    def test_the_native_scan_reached_the_engine_this_time(self):
+        # The difference from run 21, and the reason the fault is now about a symbol
+        # rather than about a library nobody looked at.
+        text = "\n".join(line.message for line in self.parsed.lines)
+        self.assertIn("hooked libunity.so=", text)
+        self.assertIn("linker dlopen located", text)
 
 
 PUBLISHED_THEN_UNOPENABLE = """\

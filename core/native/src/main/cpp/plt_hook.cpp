@@ -178,6 +178,29 @@ bool write_slot(void** slot, void* value, void** previous) {
     return true;
 }
 
+/// True for a symbol name worth reporting when a guest's own library imports it.
+///
+/// The twenty-second phone run is why this exists. `libunity.so=2` says the engine was
+/// scanned and matched two of the table's names; it does not say *which* two, and it does
+/// not say what else the library asks libc for. Both halves of that are one walk away —
+/// the relocation being examined already carries the name — and without them the next
+/// step is another guess about how Unity opens a file.
+///
+/// Deliberately loose: this is a report, not a decision. A name that is not a file
+/// operation costs one string in a log line; a name that is one and is missing from it
+/// costs a phone run.
+bool is_io_name(const char* name) {
+    static const char* kNeedles[] = {
+        "open", "stat", "access", "read", "dir",  "file",  "path",
+        "unlink", "rename", "mkdir", "creat", "chmod", "trunc", "syscall",
+        "mmap", "link", "remove", "close", "seek", "write",
+    };
+    for (const char* needle : kNeedles) {
+        if (strstr(name, needle) != nullptr) return true;
+    }
+    return false;
+}
+
 struct ScanContext {
     const std::vector<std::string>* filters;
     const std::vector<std::string>* excludes;
@@ -193,7 +216,34 @@ struct ScanContext {
     /// Whether the library being walked keeps its non-PLT relocations packed, and so has
     /// no relocation array for the absolute patch to reach.
     bool packed_here = false;
+    /// For a guest's own library: the table names it actually imports, and the file
+    /// operations it imports that the table does not have. Both bounded.
+    std::vector<std::string> patched_here;
+    std::vector<std::string> unhooked_here;
+    /// Whether the library being walked is the guest's own or UNIQUE's rather than the
+    /// platform's. Only these are reported by symbol: the platform's hundreds are not a
+    /// mystery and would bury the one line that is.
+    bool app_private_here = false;
 };
+
+/// `a,b,c`, or `-` for nothing. One line of a log, not a data structure.
+std::string join(const std::vector<std::string>& names) {
+    if (names.empty()) return "-";
+    std::string out;
+    for (const auto& name : names) {
+        if (!out.empty()) out += ",";
+        out += name;
+    }
+    return out;
+}
+
+void remember(std::vector<std::string>& into, const char* name, size_t limit) {
+    if (into.size() >= limit) return;
+    for (const auto& seen : into) {
+        if (seen == name) return;
+    }
+    into.emplace_back(name);
+}
 
 bool path_matches(const char* path, const std::vector<std::string>& filters) {
     if (filters.empty()) return true;
@@ -249,10 +299,22 @@ void patch_relocations(const Rela* rela, size_t count, const DynamicInfo& info,
         const char* name = info.strtab + info.symtab[sym_index].st_name;
         if (name == nullptr || name[0] == '\0') continue;
 
+        bool requested = false;
+        for (size_t r = 0; r < ctx->request_count; ++r) {
+            if (strcmp(name, ctx->requests[r].symbol) == 0) {
+                requested = true;
+                break;
+            }
+        }
+        if (ctx->app_private_here && !requested && is_io_name(name)) {
+            remember(ctx->unhooked_here, name, 24);
+        }
+
         for (size_t r = 0; r < ctx->request_count; ++r) {
             HookRequest& request = ctx->requests[r];
             if (strcmp(name, request.symbol) != 0) continue;
             request.matched = true;
+            if (ctx->app_private_here) remember(ctx->patched_here, name, 24);
 
             auto slot = reinterpret_cast<void**>(base + rela[i].r_offset);
             if (*slot == request.replacement) break;   // already ours; idempotent
@@ -324,6 +386,10 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
 
     ctx->here = 0;
     ctx->packed_here = false;
+    ctx->patched_here.clear();
+    ctx->unhooked_here.clear();
+    ctx->app_private_here = info->dlpi_name != nullptr &&
+                           strstr(info->dlpi_name, "/data/") != nullptr;
     ctx->absolute_here = path_matches(info->dlpi_name, *ctx->abs64_libraries) &&
                          !ctx->abs64_libraries->empty();
     for (int i = 0; i < info->dlpi_phnum; ++i) {
@@ -346,15 +412,23 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
     // rescan and a missing symbol respectively, and cost a round to tell apart. A library
     // under `/data/` is the guest's own or UNIQUE's; the platform's hundreds are not
     // listed when they patch nothing, because they never needed to be.
-    const bool app_private = info->dlpi_name != nullptr &&
-                             strstr(info->dlpi_name, "/data/") != nullptr;
+    const bool app_private = ctx->app_private_here;
     if ((ctx->here > 0 || app_private) && ctx->report->per_library.size() < 64) {
         const char* name = info->dlpi_name;
         const char* base = (name == nullptr) ? "" : strrchr(name, '/');
+        const std::string leaf(base != nullptr ? base + 1 : (name == nullptr ? "?" : name));
         ctx->report->per_library.emplace_back(
-                std::string(base != nullptr ? base + 1 : (name == nullptr ? "?" : name)) +
-                "=" + std::to_string(ctx->here) + (ctx->absolute_here ? "+abs" : "") +
+                leaf + "=" + std::to_string(ctx->here) + (ctx->absolute_here ? "+abs" : "") +
                 (ctx->packed_here ? "+packed" : ""));
+        // And, for a guest's own library, the names behind the number. `libunity.so=2`
+        // was true for four runs and said nothing about which two, or about what else the
+        // engine asks libc for — which is the only question left when a published path
+        // does not open for it.
+        if (app_private && ctx->report->per_library_symbols.size() < 16) {
+            ctx->report->per_library_symbols.emplace_back(
+                    leaf + " patched=" + join(ctx->patched_here) +
+                    " unhooked=" + join(ctx->unhooked_here));
+        }
     }
     return 0;
 }
@@ -368,9 +442,14 @@ HookReport hook_all(const std::vector<std::string>& path_filters,
                     std::vector<std::string>& seen) {
     std::lock_guard<std::mutex> lock(g_mutex);
     HookReport report;
-    ScanContext ctx{&path_filters,     &path_excludes, &abs64_libraries,
-                    requests,          request_count,  &report,
-                    &seen};
+    ScanContext ctx{};
+    ctx.filters = &path_filters;
+    ctx.excludes = &path_excludes;
+    ctx.abs64_libraries = &abs64_libraries;
+    ctx.requests = requests;
+    ctx.request_count = request_count;
+    ctx.report = &report;
+    ctx.seen = &seen;
     dl_iterate_phdr(scan_one, &ctx);
     return report;
 }

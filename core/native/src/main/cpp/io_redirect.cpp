@@ -150,6 +150,11 @@ int (*o_open_2)(const char*, int) = nullptr;
 int (*o_openat_2)(int, const char*, int) = nullptr;
 ssize_t (*o_readlink_chk)(const char*, char*, size_t, size_t) = nullptr;
 ssize_t (*o_readlinkat_chk)(int, const char*, char*, size_t, size_t) = nullptr;
+
+// Three more that take a path and were simply absent from the table. `freopen` opens one
+// outright; `statx` is the modern `stat` a recent libc++ `std::filesystem` reaches for.
+FILE* (*o_freopen)(const char*, const char*, FILE*) = nullptr;
+int (*o_statx)(int, const char*, int, unsigned int, void*) = nullptr;
 int (*o_faccessat)(int, const char*, int, int) = nullptr;
 int (*o_mkdirat)(int, const char*, mode_t) = nullptr;
 int (*o_unlinkat)(int, const char*, int) = nullptr;
@@ -376,6 +381,23 @@ ssize_t h_readlink(const char* path, char* buf, size_t size) {
     const size_t copied = shown.size() < size ? shown.size() : size;
     std::memcpy(buf, shown.data(), copied);
     return static_cast<ssize_t>(copied);
+}
+
+FILE* h_freopen(const char* path, const char* mode, FILE* stream) {
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    return o_freopen != nullptr ? o_freopen(target, mode, stream)
+                                : ::freopen(target, mode, stream);
+}
+
+/// `statx(dirfd, path, flags, mask, buf)` — the path is the second argument.
+///
+/// The buffer type is opaque here on purpose: `struct statx` needs a kernel header this
+/// file does not include, and nothing in the trampoline looks inside it.
+int h_statx(int dirfd, const char* path, int flags, unsigned int mask, void* out) {
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    return o_statx != nullptr ? o_statx(dirfd, target, flags, mask, out) : -1;
 }
 
 int h_statfs(const char* path, struct statfs* out) {
@@ -863,6 +885,9 @@ InstallStatus install_locked() {
         // And two more the same file uses: `remove` for delete and `creat` for a
         // truncating create. Neither has an `at` spelling in that code.
         {"remove",      reinterpret_cast<void*>(h_remove),       reinterpret_cast<void**>(&o_remove)},
+        {"freopen",     reinterpret_cast<void*>(h_freopen),      reinterpret_cast<void**>(&o_freopen)},
+        {"freopen64",   reinterpret_cast<void*>(h_freopen),      reinterpret_cast<void**>(&o_freopen)},
+        {"statx",       reinterpret_cast<void*>(h_statx),        reinterpret_cast<void**>(&o_statx)},
         {"creat",       reinterpret_cast<void*>(h_creat),        reinterpret_cast<void**>(&o_creat)},
         {"creat64",     reinterpret_cast<void*>(h_creat),        reinterpret_cast<void**>(&o_creat)},
     };
@@ -928,6 +953,10 @@ InstallStatus install_locked() {
     // to print the same line.
     for (const auto& entry : report.per_library) {
         ULOGI("io_redirect: hooked %s", entry.c_str());
+    }
+    // The names behind the numbers, for the guest's own libraries. See plt_hook.h.
+    for (const auto& entry : report.per_library_symbols) {
+        ULOGI("io_redirect: symbols %s", entry.c_str());
     }
     // And which of the names in the table nothing in this process spells that way. This
     // is the line that would have named the fourteenth run's bug on sight: `stat` was

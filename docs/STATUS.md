@@ -53,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 150 off-device tool tests — all passing.**
+**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 153 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1713,6 +1713,49 @@ failure in, and the pattern is the same each time: the tool reads one spelling o
 and the app uses another. The `crash` check reads the tombstone now, folds both launches
 into one finding, and keeps the abort message long enough that the linker's own reason
 survives — the part that says *which library and why* is at the end of it.
+
+### The twenty-first run: the two ends of one fact, and the shape that closes both
+
+Removing the `dlopen` hook did exactly what it was for. The game loads `libunity.so`,
+starts its engine, and there is no tombstone in this log at all. Then it showed *"Not
+enough storage space to install required resources"* again:
+
+```
+E Unity: ApkAddCentralDirectory : Unable to open '/data/app/~~qDQo4EJx…/base.apk'
+E Unity: Failed to read assets/bin/Data/unity_app_guid
+```
+
+**The reason is in what the per-library line does not say.** `libmain.so=0` is there.
+`libunity.so` is not, and there is no `hooked … after loading` line in the whole log.
+`libmain.so` loads `libunity.so` through plain `dlopen`, and with that hook removed nothing
+noticed the load — so `libunity.so` was never scanned and its own `open` was never
+redirected.
+
+So runs 20 and 21 are not two faults. They are the two ends of one:
+
+| | |
+|---|---|
+| hook `dlopen` | the call reaches the linker from `libunique_native.so`, the namespace moves, and `libunity.so` cannot be found *by name* — run 20, a `JNI FatalError` in the game's own `onCreate` |
+| do not hook `dlopen` | nothing sees the load, `libunity.so` is never redirected, and the engine cannot open its own APK — run 21 |
+
+**The shape that closes both** is the one `dlopen` itself has. `libdl.so`'s is a single
+line, `__loader_dlopen(name, flags, __builtin_return_address(0))`, and the only thing a GOT
+hook destroys is that third argument. So the hook stays and calls `__loader_dlopen`
+directly with *its own caller's* return address — `libmain.so`'s, not UNIQUE's — which
+leaves the namespace exactly where it was while still redirecting the path and triggering
+the rescan.
+
+`__loader_dlopen` is exported by the dynamic linker and by nothing else, and `dlsym` will
+not answer for it: it is not in a namespace an app can reach. It is read out of the
+linker's own dynamic symbol table, by the walk `elf_symbols.h` already does for SQLite.
+**If it cannot be found, `dlopen` is left alone** — run 20's failure is fatal and run 21's
+is not, so the fallback is the side that still loads.
+
+What the next run has to show, in order: no tombstone, then
+`io_redirect: hooked … after loading …/libunity.so` and a `libunity.so=<n>` line, then
+whether `ApkAddCentralDirectory` is gone. If it is not, that line and the
+`nothing in this process imports` line beside it name the missing symbol outright, which is
+the first time this fault will have been answerable without another guess.
 
 ### Signing in: the refusal happens before the account picker, and that is measurable
 

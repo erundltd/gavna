@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "elf_symbols.h"
 #include "plt_hook.h"
 #include "proc_view.h"
 #include "sqlite_vfs.h"
@@ -651,7 +652,74 @@ void* h_android_dlopen_ext(const char* path, int flags, const void* extinfo,
     return handle;
 }
 
-// `h_dlopen` used to be here and must not come back. See the watch's request list.
+/// The linker's own `dlopen`, which takes the caller's address instead of guessing it.
+///
+/// `libdl.so`'s `dlopen` is one line — `__loader_dlopen(name, flags,
+/// __builtin_return_address(0))` — and that address decides which linker namespace a bare
+/// soname is resolved in. A GOT hook that forwards through `libunique_native.so` replaces
+/// the guest's namespace with UNIQUE's, and the twentieth phone run is what that costs:
+///
+///     Abort message: 'JNI FatalError called: Unable to load library: …/libunity.so
+///         [dlopen failed: library "libunity.so" not found]'
+///       at com.unity3d.player.UnityPlayer.loadNative
+///
+/// Calling `__loader_dlopen` directly with *our caller's* return address puts the
+/// namespace back where it was, so the hook can redirect the path without moving the
+/// resolution. Removing the hook instead — which the build after run 20 did — is not a
+/// fix either: `libmain.so` loads `libunity.so` through plain `dlopen`, so nothing then
+/// notices the load, `libunity.so` is never hooked, and the twenty-first run went
+/// straight back to `ApkAddCentralDirectory : Unable to open`.
+void* (*o_loader_dlopen)(const char*, int, const void*) = nullptr;
+
+/// True once the linker's entry point has been located. The hook is installed only then:
+/// a `dlopen` hook that cannot preserve the caller is worse than no hook at all.
+bool loader_dlopen_available() { return o_loader_dlopen != nullptr; }
+
+void* h_dlopen(const char* path, int flags) {
+    // The address inside whichever library called us — `libmain.so`, not this one.
+    const void* caller = __builtin_return_address(0);
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    void* handle = o_loader_dlopen != nullptr ? o_loader_dlopen(target, flags, caller)
+                                              : nullptr;
+    if (handle != nullptr) rescan_after_load(target);
+    return handle;
+}
+
+/// Finds `__loader_dlopen`, which only the dynamic linker exports.
+///
+/// `dlsym` will not answer for it: it is not in any namespace an app can reach, and
+/// `libdl.so` gets it through a relocation rather than a lookup. So the linker's own
+/// dynamic symbol table is read directly, the same way `sqlite_vfs.cpp` reaches SQLite.
+struct LoaderScan {
+    void* found = nullptr;
+};
+
+int look_for_loader(struct dl_phdr_info* info, size_t, void* data) {
+    auto* scan = static_cast<LoaderScan*>(data);
+    const char* name = info->dlpi_name;
+    if (name == nullptr) return 0;
+    // The linker reports itself under one of these two names on every release that has
+    // `__loader_*` at all. Restricting to them keeps this from walking four hundred
+    // symbol tables to find a symbol only one object can have.
+    if (std::strstr(name, "linker") == nullptr &&
+        std::strstr(name, "ld-android") == nullptr) {
+        return 0;
+    }
+    scan->found = elf::find_symbol(elf::read_symbols(info), "__loader_dlopen");
+    return scan->found != nullptr ? 1 : 0;
+}
+
+void resolve_loader_dlopen() {
+    if (o_loader_dlopen != nullptr) return;
+    LoaderScan scan;
+    dl_iterate_phdr(look_for_loader, &scan);
+    o_loader_dlopen =
+            reinterpret_cast<void* (*)(const char*, int, const void*)>(scan.found);
+    ULOGI("io_redirect: linker dlopen %s",
+          o_loader_dlopen != nullptr ? "located; dlopen is hooked with the caller preserved"
+                                     : "not found; dlopen is left alone");
+}
 
 }  // namespace
 
@@ -945,42 +1013,42 @@ InstallStatus install() { return install_locked(); }
 InstallStatus watch_library_loads() { return watch_locked(); }
 
 InstallStatus watch_locked() {
-    // `android_dlopen_ext` only, and `dlopen` deliberately not.
+    // Both loader entry points, and `dlopen` only when its caller can be preserved.
     //
-    // The twentieth phone run is the reason, and it is a property of the linker rather
-    // than of this table. `dlopen` in `libdl.so` is
+    // Two runs, two failures, and they are opposite ends of the same fact. `dlopen` in
+    // `libdl.so` is
     //
     //     void* dlopen(const char* name, int flags) {
     //       return __loader_dlopen(name, flags, __builtin_return_address(0));
     //     }
     //
-    // — the *caller's address* is what decides which linker namespace the name is
-    // resolved in. Forwarding the call from `libunique_native.so` replaces the guest's
-    // namespace with UNIQUE's, whose library search path does not contain the guest's
-    // libraries. So a bare soname stops resolving:
+    // so the *caller's address* decides which namespace a bare soname resolves in.
+    // Forwarding the call from `libunique_native.so` moved that to UNIQUE's namespace and
+    // Unity's `libmain.so` could no longer find `libunity.so` by name — run 20, a
+    // `JNI FatalError` in the game's own `onCreate`. Dropping the hook instead was no
+    // better: `libmain.so` loads `libunity.so` through plain `dlopen`, so nothing noticed
+    // the load, `libunity.so` was never hooked, and run 21 went straight back to
+    // `ApkAddCentralDirectory : Unable to open` and a game telling its player the device
+    // was out of storage.
     //
-    //     Abort message: 'JNI FatalError called: Unable to load library:
-    //         …/lib/arm64/libunity.so [dlopen failed: library "libunity.so" not found]'
-    //       at com.unity3d.player.UnityPlayer.loadNative
+    // So the hook stays and calls `__loader_dlopen` with its own caller's return address.
+    // If that symbol cannot be found, `dlopen` is left alone — the run-20 failure is
+    // fatal and the run-21 one is not, so the safe side is the one that loads.
     //
-    // Unity's `libmain.so` asks for `libunity.so` by name, and the game died in its own
-    // `onCreate`. Runs 17 and 18 did not, for the only reason that the watch was armed
-    // once and had never reached `libmain.so`; re-arming it per load — correct in itself —
-    // is what exposed this.
-    //
-    // `android_dlopen_ext` does not have the problem: `libnativeloader` passes an
-    // `android_dlextinfo` that names the namespace outright, so the caller's address is
-    // not consulted. That is the route `System.loadLibrary` takes, which is how the
-    // libraries this watch exists for arrive.
-    //
-    // The cost is stated rather than hidden: a library a guest `dlopen`s *itself*, by a
-    // path rather than through the loader, is not redirected and does not trigger a
-    // rescan until the next `System.loadLibrary`. Closing that needs `__loader_dlopen`
-    // and the caller's own return address, not this.
-    static plt::HookRequest requests[] = {
+    // `android_dlopen_ext` never had the problem: `libnativeloader` passes an
+    // `android_dlextinfo` naming the namespace outright, so the caller is not consulted.
+    resolve_loader_dlopen();
+    static plt::HookRequest with_dlopen[] = {
+        {"android_dlopen_ext", reinterpret_cast<void*>(h_android_dlopen_ext),
+         reinterpret_cast<void**>(&o_android_dlopen_ext)},
+        {"dlopen", reinterpret_cast<void*>(h_dlopen), nullptr},
+    };
+    static plt::HookRequest without_dlopen[] = {
         {"android_dlopen_ext", reinterpret_cast<void*>(h_android_dlopen_ext),
          reinterpret_cast<void**>(&o_android_dlopen_ext)},
     };
+    plt::HookRequest* requests = loader_dlopen_available() ? with_dlopen : without_dlopen;
+    const size_t request_count = loader_dlopen_available() ? 2 : 1;
 
     // Narrow and explicit: the loader plumbing, plus the guest's own code.
     std::vector<std::string> scope;
@@ -997,8 +1065,7 @@ InstallStatus watch_locked() {
     // all, which is a different and larger loss than not redirecting the protector.
     static std::vector<std::string> seen;
     static const std::vector<std::string> none;
-    auto report = plt::hook_all(scope, none, none, requests,
-                                sizeof(requests) / sizeof(requests[0]), seen);
+    auto report = plt::hook_all(scope, none, none, requests, request_count, seen);
     // Sticky, and it has to be: this runs again after every library load, and a pass that
     // walks only libraries it has already seen patches nothing. Reading that as "the watch
     // is not installed" would be the same mistake `kNothingToHook` was added to stop.

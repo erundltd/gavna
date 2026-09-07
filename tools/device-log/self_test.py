@@ -66,6 +66,8 @@ FIXTURE19 = os.path.join(HERE, "fixtures", "redmi-android15-run19.log")
 FIXTURE19_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run19.device.txt")
 FIXTURE20 = os.path.join(HERE, "fixtures", "redmi-android15-run20.log")
 FIXTURE20_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run20.device.txt")
+FIXTURE21 = os.path.join(HERE, "fixtures", "redmi-android15-run21.log")
+FIXTURE21_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run21.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -1430,6 +1432,49 @@ class RedmiRun20Test(unittest.TestCase):
         # to the redirect table, which is not where the fault is.
         self.assertEqual(self.checks["paths"].verdict, analyze.PASS)
         self.assertIn("code and data paths both published", notes(self.checks["paths"]))
+
+
+class RedmiRun21Test(unittest.TestCase):
+    """The twenty-first run: the game starts, and the other end of the same fact bites.
+
+    Removing the `dlopen` hook fixed run 20 exactly as intended — the game loads
+    `libunity.so`, starts its engine, and there is no tombstone in this log. And then it
+    showed *"Not enough storage space to install required resources"* again:
+
+    ```
+    E Unity: ApkAddCentralDirectory : Unable to open '/data/app/~~qDQo4EJx…/base.apk'
+    E Unity: Failed to read assets/bin/Data/unity_app_guid
+    ```
+
+    The reason is in what the per-library line does *not* say. `libmain.so=0` is there;
+    `libunity.so` is not, and there is no `hooked … after loading` line in the whole log.
+    `libmain.so` loads `libunity.so` through plain `dlopen`, and with that hook removed
+    nothing noticed the load — so `libunity.so` was never scanned and its own `open` was
+    never redirected.
+
+    Runs 20 and 21 are therefore the two ends of one fact rather than two faults: hooking
+    `dlopen` moves the namespace and the game cannot load its engine; not hooking it means
+    nothing sees the load and the engine cannot read its own APK. The answer is to hook it
+    and call `__loader_dlopen` with the *caller's* return address, which is what `dlopen`
+    itself does and what a GOT hook otherwise destroys.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE21, FIXTURE21_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_the_game_no_longer_dies_loading_its_engine(self):
+        self.assertEqual(self.checks["crash"].verdict, analyze.PASS)
+
+    def test_the_published_apk_is_still_unopenable_by_the_engine(self):
+        detail = findings(self.checks["paths"])
+        self.assertIn("did not resolve for Unity", detail)
+        self.assertIn("base.apk", detail)
+
+    def test_google_and_paths_are_the_failing_checks(self):
+        failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
+        self.assertEqual(failing, ["google", "paths"])
 
 
 PUBLISHED_THEN_UNOPENABLE = """\

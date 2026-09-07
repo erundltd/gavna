@@ -31,6 +31,10 @@ never written as `SUPPORTED` because something ought to work.
 
 ---
 
+> **Picking this project up?** [`docs/HANDOFF.md`](docs/HANDOFF.md) is the whole
+> situation in one file: what is built, what is measured, what is stuck, where the
+> signing key is, and the claims that have already been made and retracted.
+
 ## Where the project actually is
 
 | | |

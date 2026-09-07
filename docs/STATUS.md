@@ -10,6 +10,10 @@ launched into a `:vappN` process where it believes it is itself. Its Activity, S
 manifest BroadcastReceiver and ContentProvider all run as the guest, in the guest's
 storage, in the guest's process. Evidence is checked in under `docs/evidence/`.
 
+For a single-file account of the whole project — build, signing key, the target
+application, every open item and the claims already retracted — see
+[`HANDOFF.md`](HANDOFF.md).
+
 ## What each environment can prove
 
 | Environment | Proves | Cannot prove |

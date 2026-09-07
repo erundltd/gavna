@@ -679,6 +679,29 @@ def check_crashes(run: Run) -> Check:
         )
         add(process, reason, line.lineno, thread)
 
+    # The platform's tombstone, which is the only record of a crash that killed the
+    # process below Java. `AndroidRuntime: FATAL EXCEPTION` covers an uncaught Java
+    # exception and nothing else; an `abort()` — `JNI FatalError`, a failed `CHECK`, a
+    # native assertion — produces a `DEBUG` block instead, and the twentieth run is what
+    # missing it costs: the game died in `UnityPlayer.loadNative` and this check said
+    # "no crash" while the tester was watching it close.
+    #
+    # The block names the process on its own line, and `Abort message` carries the whole
+    # reason, so both are read out of the same window rather than inferred.
+    for i, line in enumerate(run.lines):
+        if line.tag != "DEBUG" or not line.message.startswith("Abort message:"):
+            continue
+        reason = line.message.split(":", 1)[1].strip().strip("'")
+        window = run.lines[max(0, i - 12) : i]
+        process = ""
+        for candidate in window:
+            m = re.search(r">>> ([\w.:]+) <<<", candidate.message)
+            if m:
+                process = m.group(1).split(":", 1)[0]
+                break
+        if process and process not in imported:
+            continue
+        add(process, f"aborted: {reason}", line.lineno)
     for event in run.by_code("UNCAUGHT_EXCEPTION"):
         add(event.package or "", event["reason"] or "", event.lineno, event["thread"] or "")
     for event in run.by_code("NATIVE_CRASH"):
@@ -697,6 +720,12 @@ def _exception_kind(reason: str) -> str:
     the innermost recognisable exception plus a short prefix is what makes two records of
     one crash compare equal without collapsing two genuinely different ones.
     """
+    # An abort message is not an exception and must not be folded as one. `JNI FatalError
+    # called: Unable to load library: …/libunity.so [dlopen failed: …]` contains the word
+    # `FatalError`, and reading only that turns the one line that says *which library and
+    # why* into three words that say neither.
+    if reason.startswith("aborted:"):
+        return reason[:120]
     matches = _EXCEPTION.findall(reason)
     if not matches:
         return reason[:60]
@@ -714,6 +743,12 @@ def _exception_line(reason: str) -> str:
     package name inside `Unknown calling package name 'com.example.app'` is exactly the
     part a 40-character identity cuts off, and exactly the part that says which guest.
     """
+    if reason.startswith("aborted:"):
+        # Longer than an exception line is allowed to be, and deliberately: the whole
+        # value of an abort message is at its end — the linker's own reason, the path it
+        # could not open, the assertion that failed. Cutting it at 110 characters leaves
+        # "JNI FatalError called: Unable to load library:" and nothing else.
+        return reason.strip()[:280]
     matches = _EXCEPTION.findall(reason)
     if not matches:
         return reason.strip()[:110]

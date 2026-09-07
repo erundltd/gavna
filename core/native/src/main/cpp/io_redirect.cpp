@@ -595,7 +595,6 @@ bool g_sqlite_replaced = false;
 
 // The loader entry points, captured when the watch is installed.
 void* (*o_android_dlopen_ext)(const char*, int, const void*, const void*) = nullptr;
-void* (*o_dlopen)(const char*, int) = nullptr;
 
 /// True while this thread is already re-scanning, so a load triggered from inside the
 /// scan cannot recurse into it.
@@ -631,20 +630,28 @@ void rescan_after_load(const char* what) {
     t_rescanning = false;
 }
 
+/// `System.loadLibrary`'s route into the linker, and the only load this may intercept.
+///
+/// The path is redirected like any other, because a guest that has been told its
+/// libraries are at `/data/app/~~…/lib/arm64` will ask for one by that name.
+///
+/// **`extinfo` is what makes this safe and its absence is what made the plain `dlopen`
+/// hook unsafe.** `libnativeloader` passes an `android_dlextinfo` naming the class
+/// loader's namespace explicitly, so the linker does not have to work out which namespace
+/// to resolve in — see the comment on the watch's request list for the run that
+/// established what happens when it does.
 void* h_android_dlopen_ext(const char* path, int flags, const void* extinfo,
                            const void* caller) {
+    std::string holder;
+    const char* target = rewrite(path, holder);
     void* handle = o_android_dlopen_ext != nullptr
-            ? o_android_dlopen_ext(path, flags, extinfo, caller)
+            ? o_android_dlopen_ext(target, flags, extinfo, caller)
             : nullptr;
-    if (handle != nullptr) rescan_after_load(path);
+    if (handle != nullptr) rescan_after_load(target);
     return handle;
 }
 
-void* h_dlopen(const char* path, int flags) {
-    void* handle = o_dlopen != nullptr ? o_dlopen(path, flags) : ::dlopen(path, flags);
-    if (handle != nullptr) rescan_after_load(path);
-    return handle;
-}
+// `h_dlopen` used to be here and must not come back. See the watch's request list.
 
 }  // namespace
 
@@ -938,10 +945,41 @@ InstallStatus install() { return install_locked(); }
 InstallStatus watch_library_loads() { return watch_locked(); }
 
 InstallStatus watch_locked() {
+    // `android_dlopen_ext` only, and `dlopen` deliberately not.
+    //
+    // The twentieth phone run is the reason, and it is a property of the linker rather
+    // than of this table. `dlopen` in `libdl.so` is
+    //
+    //     void* dlopen(const char* name, int flags) {
+    //       return __loader_dlopen(name, flags, __builtin_return_address(0));
+    //     }
+    //
+    // — the *caller's address* is what decides which linker namespace the name is
+    // resolved in. Forwarding the call from `libunique_native.so` replaces the guest's
+    // namespace with UNIQUE's, whose library search path does not contain the guest's
+    // libraries. So a bare soname stops resolving:
+    //
+    //     Abort message: 'JNI FatalError called: Unable to load library:
+    //         …/lib/arm64/libunity.so [dlopen failed: library "libunity.so" not found]'
+    //       at com.unity3d.player.UnityPlayer.loadNative
+    //
+    // Unity's `libmain.so` asks for `libunity.so` by name, and the game died in its own
+    // `onCreate`. Runs 17 and 18 did not, for the only reason that the watch was armed
+    // once and had never reached `libmain.so`; re-arming it per load — correct in itself —
+    // is what exposed this.
+    //
+    // `android_dlopen_ext` does not have the problem: `libnativeloader` passes an
+    // `android_dlextinfo` that names the namespace outright, so the caller's address is
+    // not consulted. That is the route `System.loadLibrary` takes, which is how the
+    // libraries this watch exists for arrive.
+    //
+    // The cost is stated rather than hidden: a library a guest `dlopen`s *itself*, by a
+    // path rather than through the loader, is not redirected and does not trigger a
+    // rescan until the next `System.loadLibrary`. Closing that needs `__loader_dlopen`
+    // and the caller's own return address, not this.
     static plt::HookRequest requests[] = {
         {"android_dlopen_ext", reinterpret_cast<void*>(h_android_dlopen_ext),
          reinterpret_cast<void**>(&o_android_dlopen_ext)},
-        {"dlopen", reinterpret_cast<void*>(h_dlopen), reinterpret_cast<void**>(&o_dlopen)},
     };
 
     // Narrow and explicit: the loader plumbing, plus the guest's own code.

@@ -64,6 +64,53 @@ install over them.
 
 ## What changed since the last phone run
 
+Игра вылетает — и это моя ошибка, внесённая две сборки назад. Нашёл, исправил.
+
+### Что именно произошло
+
+```
+Abort message: 'JNI FatalError called: Unable to load library:
+    …/lib/arm64/libunity.so [dlopen failed: library "libunity.so" not found]'
+  → com.unity3d.player.UnityPlayer.loadNative
+  → com.unity3d.player.UnityPlayerActivity.onCreate
+```
+
+Игра падает в самом начале, ещё до запуска своего движка. Обрати внимание, на что ругается
+система: не на путь из сообщения, а на **имя** `libunity.so`.
+
+В Android имя библиотеки ищется в «пространстве имён» **той библиотеки, которая её
+запрашивает** — система смотрит, кто именно вызвал загрузку. Я перехватывал этот вызов, и
+из-за перехвата получалось, что запрашивает его UNIQUE, а не сам Unity. В списке путей
+UNIQUE библиотеки игры, естественно, нет — отсюда «not found».
+
+Сам перехват стоял давно. Но две сборки назад я исправил другую вещь — включил
+отслеживание загрузки библиотек не один раз, а постоянно — и именно из-за этого перехват
+впервые дотянулся до загрузчика Unity. То есть я починил одно и сломал другое.
+
+**Исправлено:** перехват `dlopen` убран совсем. Второй, безопасный путь загрузки
+(`android_dlopen_ext`, через который идёт `System.loadLibrary`) остаётся — там система
+получает нужное пространство имён явным параметром, и подмена ей не мешает.
+
+### И то же самое было в прошлом логе, а я не увидел
+
+В логе от 17:25 эти же два падения уже были. Мой анализатор их не показал: он читал только
+падения Java, а это падение уровнем ниже — оно оставляет другой вид записи. Теперь читает
+оба, и сообщение об ошибке сохраняется целиком, потому что самое важное в нём — в конце
+(какая библиотека и почему).
+
+Это уже третий раз за четыре прогона, когда проверка говорила «всё хорошо», а у тебя на
+экране была ошибка. Каждый раз по одной и той же причине: приложение пишет о сбое не тем
+способом, который анализатор искал. Каждый такой случай теперь закрыт тестом на твоём же
+логе.
+
+### Что посмотреть
+
+1. **Standoff 2 — запускается ли вообще и доходит ли до меню.** Это главное.
+2. Если дошла — есть ли ещё табличка про нехватку места.
+3. Если и её нет — вход через Google: появляется ли список аккаунтов.
+
+## What changed one run ago
+
 Короткий лог, но в нём одна победа, один новый сбой и один вопрос, который остался
 открытым. По порядку.
 
@@ -119,7 +166,7 @@ F libc: Fatal signal 5 (SIGTRAP) … (.openai.chatgpt)
 3. **Пара приложений с данными** — на месте ли данные.
 4. **Вход через Google** (если игра дошла до меню) — появляется ли список аккаунтов.
 
-## What changed one run ago
+## What changed two runs ago
 
 Твой лог — самый полезный за всё время. В нём одновременно первое настоящее достижение и
 причина той таблички «Not enough storage space», которую ты прислал.
@@ -181,7 +228,7 @@ E Unity: Failed to read assets/bin/Data/unity_app_guid
 4. Если вход прошёл — дождись загрузки и посмотри, появляется ли табличка про виртуальное
    пространство. Она приходит **после** входа.
 
-## What changed two runs ago
+## What changed three runs ago
 
 Твой лог впервые показал то, ради чего делались три предыдущие сборки, — и заодно показал,
 что одна из них вообще не работала.
@@ -307,7 +354,7 @@ GOOGLE_SIGN_IN_RETARGETED … to=com.unique serverToken=requested
    виртуальное пространство. Она приходит **после** входа, поэтому запуск без входа про неё
    ничего не доказывает.
 
-## What changed three runs ago
+## What changed four runs ago
 
 Хорошая новость: возврат сработал. Никаких падений драйвера, ничего не крашится, игра
 запускается и показывает своё меню — на скриншоте это видно. Осталось два провала, и один
@@ -352,7 +399,7 @@ Java всё равно не видит». Последнее — это то, ч
 Порядок от этого не меняется: сначала пути, потом вход. Но теперь ясно, что до таблички про
 виртуальное пространство мы ещё не дошли — а значит и не проверили то, ради чего всё это.
 
-## What changed four runs ago
+## What changed five runs ago
 
 Прошлая сборка сделала хуже, и твой лог говорит чем — одной строкой.
 
@@ -401,7 +448,7 @@ E CRASH: signal 6 (SIGABRT) … name: RenderThread >>> com.axlebolt.standoff2 <<
 то, ради чего стоит работать, потому что в отличие от аттестации она находится в
 досягаемости.
 
-## What changed five runs ago
+## What changed six runs ago
 
 Your log was the most useful one this project has had, and not because things worked. Both
 of the safety checks I built into the last build fired, and one of them was right to.
@@ -543,7 +590,7 @@ uses the native Google API.
 3. Whether the "virtual space" notice appears in Standoff 2 — and whether the
    "not enough memory" one is gone.
 
-## What changed six runs ago
+## What changed seven runs ago
 
 **Your last log was the best one yet: seventeen of eighteen checks passed.** The game
 launched, ran, did not crash, and did not die on the sign-in button the way it did before.
@@ -613,7 +660,7 @@ such thing — the only line containing that word was UNIQUE's own explanation o
 *would* happen. A tool that cannot tell its own prediction from a real answer is worse than
 no tool, because both read identically. Fixed, with a test.
 
-## What changed seven runs ago
+## What changed eight runs ago
 
 **I read the game.** Two passes were spent guessing at what Standoff 2 checks; this time
 the check itself was found, in the shipping build, and it is not what either of us assumed.
@@ -708,7 +755,7 @@ What was new is underneath, and it is worse than the crash:
   the protector changes its mind is a measurement, not a promise — if it still fails, it
   fails for a reason worth reading.
 
-## What changed eight runs ago
+## What changed nine runs ago
 
 The rewrite from the last build worked — your log shows 17 requests going out under a
 name Google accepts, and the game-files message is gone. What it uncovered is three more
@@ -735,7 +782,7 @@ covered all of them.** The `DEVELOPER_ERROR` is real for a request that reaches 
 UNIQUE. But this crash never reached Google at all. Try signing in on this build and send
 the log: what happens now is something nobody has measured, me included.
 
-## What changed nine runs ago
+## What changed ten runs ago
 
 - **Google Play services actually works now.** There was one refusal behind every Google
   failure this project has ever had: Play services checks that the calling app's name
@@ -760,7 +807,7 @@ the log: what happens now is something nobody has measured, me included.
   picker reaches, several at once. It is still reachable from an app's own Storage
   section, which opens it directly inside that app.
 
-## What changed ten runs ago
+## What changed eleven runs ago
 
 Six things were reported. Two of them were mistakes of mine, one was a request, and the
 log had all of them.
@@ -795,7 +842,7 @@ log had all of them.
   services resolves the caller to UNIQUE, so a token comes back for UNIQUE and not for the
   app. Only Play services running *inside* the space can answer that, and it is not built.
 
-## What changed eleven runs ago
+## What changed twelve runs ago
 
 That log was answered with two words — *"nothing changed"* — and a screenshot of a
 notification asking to install Google Play services. That was fair. The build was
@@ -822,7 +869,7 @@ installed and its new code was running; the code was wrong.
   passed on the log that produced that notification; this is the seventeenth, and it is
   asserted against that same log so the rule cannot come back quietly.
 
-## What changed twelve runs ago
+## What changed thirteen runs ago
 
 Six apps launched in that run and three of them died seconds later, all of the same thing.
 This build answers everything that log reported.

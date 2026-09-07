@@ -64,6 +64,8 @@ FIXTURE18 = os.path.join(HERE, "fixtures", "redmi-android15-run18.log")
 FIXTURE18_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run18.device.txt")
 FIXTURE19 = os.path.join(HERE, "fixtures", "redmi-android15-run19.log")
 FIXTURE19_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run19.device.txt")
+FIXTURE20 = os.path.join(HERE, "fixtures", "redmi-android15-run20.log")
+FIXTURE20_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run20.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -1359,9 +1361,75 @@ class RedmiRun19Test(unittest.TestCase):
         # would exclude a library that was not the cause and cost a round.
         self.assertIn("an exclusion here would not fix it", notes(self.checks["native"]))
 
+    def test_the_game_had_already_died_in_this_run_and_nothing_said_so(self):
+        # Found only when the twentieth run made the same abort unmissable. Two
+        # `JNI FatalError` tombstones are in this log, the game closed itself both times,
+        # and every check passed except `google` and `native`. `AndroidRuntime: FATAL
+        # EXCEPTION` covers an uncaught Java exception and nothing else; an `abort()`
+        # leaves a `DEBUG` block, which nothing read.
+        detail = findings(self.checks["crash"])
+        self.assertIn("JNI FatalError called", detail)
+        self.assertIn("libunity.so", detail)
+
     def test_the_engine_itself_did_not_regress(self):
         for name in ("engine", "launch", "slots", "detection", "render", "signin"):
             self.assertEqual(self.checks[name].verdict, analyze.PASS, name)
+
+
+class RedmiRun20Test(unittest.TestCase):
+    """The twentieth run: the game dies in its own `onCreate`, and the cause is UNIQUE's.
+
+    "Захожу в standoff 2 вылетает и все" — and the log agrees, twice:
+
+    ```
+    Abort message: 'JNI FatalError called: Unable to load library:
+        /data/app/~~qDQo4EJx…/com.axlebolt.standoff2-ZoMeAB09…/lib/arm64/libunity.so
+        [dlopen failed: library "libunity.so" not found]'
+      #05 …/lib/arm64-v8a/libmain.so
+      #08 com.unity3d.player.UnityPlayer.loadNative
+      #16 com.unity3d.player.UnityPlayerActivity.onCreate
+    ```
+
+    Note what the linker actually complained about: `library "libunity.so" not found`, the
+    bare soname, not the path in the message. Unity's `libmain.so` asks for it by name, and
+    a name is resolved in **the calling library's linker namespace** — `dlopen` in
+    `libdl.so` passes `__builtin_return_address(0)` to the loader for exactly that. The
+    library-load watch hooks `dlopen`, so the call arrived at the loader from
+    `libunique_native.so`, and UNIQUE's namespace does not contain the guest's libraries.
+
+    The `dlopen` hook is not new; re-arming the watch on every load is, and that is what
+    first put it in front of `libmain.so`. So this is a regression introduced two runs
+    earlier and only visible once Unity got far enough to load. `android_dlopen_ext` keeps
+    its hook — `libnativeloader` names the namespace explicitly in `android_dlextinfo`, so
+    the caller's address is never consulted — and the plain `dlopen` hook is gone.
+
+    The other half of this fixture is what the analyzer had to learn: it reported **no
+    crash** on a run whose guest aborted twice. `AndroidRuntime: FATAL EXCEPTION` is an
+    uncaught *Java* exception; an `abort()` leaves a `DEBUG` tombstone with an
+    `Abort message:` line, and nothing read it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE20, FIXTURE20_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_the_abort_is_reported_with_the_library_and_the_linker_s_reason(self):
+        detail = findings(self.checks["crash"])
+        self.assertIn("com.axlebolt.standoff2 crashed", detail)
+        self.assertIn("Unable to load library", detail)
+        self.assertIn('library "libunity.so" not found', detail)
+
+    def test_the_two_tombstones_are_one_finding(self):
+        # Both launches died the same way. Reporting it twice would say two faults.
+        self.assertEqual(len(self.checks["crash"].findings), 1)
+
+    def test_the_paths_check_still_passes_because_this_is_not_a_path_fault(self):
+        # The path in the message resolves; what failed is a *namespace* lookup for a
+        # bare soname. Reporting it as a published-path failure would send the next round
+        # to the redirect table, which is not where the fault is.
+        self.assertEqual(self.checks["paths"].verdict, analyze.PASS)
+        self.assertIn("code and data paths both published", notes(self.checks["paths"]))
 
 
 PUBLISHED_THEN_UNOPENABLE = """\

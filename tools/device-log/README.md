@@ -183,6 +183,24 @@ with whatever was hooked most recently, which was Sentry and Conscrypt, and the 
 two lines above in `paths`. It cross-references `paths` now rather than sending the next
 round to an exclusion that would not have helped.
 
+### What the twentieth run added to `crash`
+
+The check read `AndroidRuntime: FATAL EXCEPTION`, which is an uncaught **Java** exception
+and nothing else. An `abort()` — a `JNI FatalError`, a failed `CHECK`, a native assertion —
+does not produce one. It produces a `DEBUG` tombstone:
+
+```
+F DEBUG : pid: 13011, tid: 13011, name: ebolt.standoff2 >>> com.axlebolt.standoff2 <<<
+F DEBUG : Abort message: 'JNI FatalError called: Unable to load library:
+              …/lib/arm64/libunity.so [dlopen failed: library "libunity.so" not found]'
+```
+
+So the nineteenth run — in which the game died twice, in its own `onCreate` — reported no
+crash at all, and the twentieth was sent in with "захожу в standoff 2 вылетает и все"
+against a tool that said everything was fine. Both are read now, folded into one finding
+per process and reason, and the abort message is kept long enough that the linker's own
+explanation survives: the part that says which library and why is at the *end* of it.
+
 ### The one the seventeenth run added: `signin`
 
 Separate from `google`, and the separation is the finding. `google` asks whether a guest

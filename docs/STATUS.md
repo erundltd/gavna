@@ -53,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 146 off-device tool tests — all passing.**
+**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 150 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1668,6 +1668,51 @@ APK's — which the event does not carry, because they are arithmetic on the pac
 whatever was hooked most recently, which here was Sentry and Conscrypt; acting on that
 would have excluded a library that was not the cause and cost a round. It cross-references
 `paths` now and says so.
+
+### The twentieth run: the game dies in its own `onCreate`, and the cause is UNIQUE's
+
+> "захожу в standoff 2 вылетает и все"
+
+```
+Abort message: 'JNI FatalError called: Unable to load library:
+    /data/app/~~qDQo4EJx…/com.axlebolt.standoff2-ZoMeAB09…/lib/arm64/libunity.so
+    [dlopen failed: library "libunity.so" not found]'
+  #05 …/lib/arm64-v8a/libmain.so
+  #08 com.unity3d.player.UnityPlayer.loadNative
+  #16 com.unity3d.player.UnityPlayerActivity.onCreate
+```
+
+**Read what the linker actually complained about.** Not the path in the message —
+`library "libunity.so" not found`, the bare soname. Unity's `libmain.so` asks for it by
+name, and a name is resolved in **the calling library's linker namespace**: `dlopen` in
+`libdl.so` is one line that hands `__builtin_return_address(0)` to the loader for exactly
+that purpose. The library-load watch hooks `dlopen`, so the call reached the loader from
+`libunique_native.so`, and UNIQUE's namespace does not contain the guest's libraries.
+
+**This is a regression, and it is mine.** The `dlopen` hook is old; re-arming the watch on
+every library load — added after run 18, and correct in itself — is what first put it in
+front of `libmain.so`. Runs 17 and 18 were spared only because the watch had been armed
+once and had never reached that library.
+
+The hook is gone. `android_dlopen_ext` keeps its own, because `libnativeloader` passes an
+`android_dlextinfo` that names the namespace outright and the caller's address is never
+consulted — and that is the route `System.loadLibrary` takes, which is how the libraries
+the watch exists for arrive. It now redirects the path as well, which it did not. The cost
+is stated rather than hidden: a library a guest `dlopen`s *itself* is not redirected and
+does not trigger a rescan until the next `System.loadLibrary`.
+
+**And the nineteenth run had this too.** Two of the same tombstones, in the log that was
+read as "the data half reaches two apps". It was missed because the analyzer's `crash`
+check reads `AndroidRuntime: FATAL EXCEPTION`, which is an uncaught *Java* exception and
+nothing else. An `abort()` — a `JNI FatalError`, a failed `CHECK`, a native assertion —
+leaves a `DEBUG` tombstone with an `Abort message:` line instead, and nothing read it. So
+a run in which the game died twice reported no crash at all.
+
+That is the third time in four runs that a check passed a log the tester was watching a
+failure in, and the pattern is the same each time: the tool reads one spelling of a fault
+and the app uses another. The `crash` check reads the tombstone now, folds both launches
+into one finding, and keeps the abort message long enough that the linker's own reason
+survives — the part that says *which library and why* is at the end of it.
 
 ### Signing in: the refusal happens before the account picker, and that is measurable
 

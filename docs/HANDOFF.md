@@ -60,7 +60,7 @@ exist because a claim was made without evidence and a later phone log contradict
 - `/proc/self/maps` inside a guest no longer names UNIQUE — `PROC_VIEW_INSTALLED …
   named=16 leaked=0` on the phone, and the graft checks its own work.
 - Two instances of one app have separate identities, storage and `ANDROID_ID`.
-- 302 JVM tests, 142 host-side native checks, 129 device-log tests, 17 APK-survey tests, 15
+- 302 JVM tests, 142 host-side native checks, 133 device-log tests, 17 APK-survey tests, 15
   Dart tests. All passing.
 
 ### Does not work
@@ -92,7 +92,7 @@ The NDK is installed by Gradle on first native build. AGP 8.13.0, Kotlin 2.2.20.
 ./gradlew test                    # 302 JVM tests
 ./tools/native-test/run.sh        # 142 native checks; 38 need an NDK and skip without one
 (cd ui && flutter test)           # 15 Dart tests
-./tools/device-log/self_test.py   # 129 tests for the log analyzer, no toolchain
+./tools/device-log/self_test.py   # 133 tests for the log analyzer, no toolchain
 ./tools/apk-survey/self_test.py   # 17 tests
 ./tools/check-translations.py     # every engine failure has both languages
 ./tools/report-unimplemented.sh   # every deliberately unimplemented surface
@@ -340,6 +340,7 @@ This is where most of the recent work happened and where the next bug will proba
 | SQLite through `xSetSystemCall`, not through relocations | 18 | **`data=true`, `sqlite=8`** — and the game could not open the path it had been given, for two reasons that are not about scope either |
 | + `__open_2`, the re-armed load watch | 19 | Sentry and Conscrypt hooked for the first time; `libunity.so` never loaded, so the fault it was for is still unanswered. **WebView's renderer** was handed the published *data* path, could not create a directory under it, and trapped |
 | + `libwebviewchromium.so` and the Trichrome names | 19 | untested |
+| − the plain `dlopen` hook | 20 | the game died in `UnityPlayer.loadNative`: hooking `dlopen` moves the *caller* and therefore the linker namespace, so a bare soname stops resolving. A regression from the run-18 watch re-arm, and it was in run 19 too |
 
 **The lesson from run 15, which is the important one**: the safety argument ("no rule can
 match `/data/user/0/com.unique`, so a hooked library touching UNIQUE's files is unaffected")
@@ -386,6 +387,36 @@ app's linker namespace refuses to `dlopen`, by walking the loaded library's own 
 Read `sqlite=<n>` on `IO_REDIRECT_INSTALLED` and on `GUEST_PATHS_PUBLISHED`. Zero with a
 database refusal is now a `paths` failure rather than a note, and `+packed` on the
 per-library line confirms or retracts the premise above directly.
+
+### Hooking `dlopen` moves the namespace — never do it again
+
+`dlopen` in `libdl.so` is one line:
+
+```c
+void* dlopen(const char* name, int flags) {
+  return __loader_dlopen(name, flags, __builtin_return_address(0));
+}
+```
+
+The **caller's address** is what decides which linker namespace a bare soname is resolved
+in. A GOT hook forwards the call from `libunique_native.so`, so the guest's namespace is
+replaced by UNIQUE's, whose search path does not contain the guest's libraries. The
+twentieth run is that, exactly:
+
+```
+Abort message: 'JNI FatalError called: Unable to load library: …/lib/arm64/libunity.so
+    [dlopen failed: library "libunity.so" not found]'
+  at com.unity3d.player.UnityPlayer.loadNative
+```
+
+Unity's `libmain.so` asks for `libunity.so` by name. The hook is not new; re-arming the
+watch per load put it in front of `libmain.so` for the first time, and the game died in
+its own `onCreate`. `android_dlopen_ext` is safe and keeps its hook: `libnativeloader`
+names the namespace in an `android_dlextinfo`, so the caller's address is never consulted.
+
+The cost, stated: a library a guest `dlopen`s itself is not redirected and does not
+trigger a rescan until the next `System.loadLibrary`. Closing it needs `__loader_dlopen`
+and the caller's own return address, not a GOT hook on `dlopen`.
 
 ### The two the eighteenth run found, and how both hid
 
@@ -450,7 +481,7 @@ phone run is checked in as a fixture under `tools/device-log/fixtures/` with ass
 `self_test.py`, so **a check that stops reporting a fault a real phone produced is a
 regression in the tool** rather than progress in the engine.
 
-Seventeen captures are checked in — the first run, then runs 4 through 19; runs 2 and 3
+Eighteen captures are checked in — the first run, then runs 4 through 20; runs 2 and 3
 predate the analyzer and were never kept. When a new log arrives:
 
 1. run the analyzer;
@@ -465,9 +496,13 @@ predate the analyzer and were never kept. When a new log arrives:
 
 ## 8. What to do next, in order
 
-1. **The twentieth run**, and the first question is still whether the game starts at all.
-   Run 19 did not answer it: the game was closed eight seconds in, before `libunity.so`
-   loaded, so there is no `I Unity:` line in that log.
+1. **The twenty-first run**, and the first question is still whether the game starts.
+   Runs 19 and 20 both died in `UnityPlayer.loadNative` before the engine existed, so
+   nothing downstream of it has been measured yet — including whether the eighteenth run's
+   `__open_2` fix did what it was for.
+   - **No `JNI FatalError … libunity.so` tombstone.** That is what the `dlopen` hook
+     removal is for, and the `crash` check reads the tombstone now rather than only
+     `AndroidRuntime`.
    - **No "Not enough storage space" dialog**, and no `E Unity: ApkAddCentralDirectory`
      in the log. That is the whole of what the two fixes above are for. If it is still
      there, the log now names the library that patched nothing —

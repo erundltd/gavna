@@ -189,7 +189,7 @@ virtualization detector. UNIQUE's tree is not in it, and adding UNIQUE to it wou
 someone at Axlebolt writing it down. It is recorded here so that it is not mistaken for the
 mechanism above.
 
-### Play Integrity is in the build, and the phone says it is not used
+### Play Integrity is in the build, and what the phone can and cannot say about it
 
 `Google.Play.Integrity`, `IntegrityManager`, `RequestIntegrityToken`, `environmentIntegrity`
 and `GooglePlayIntegrityCheckRpcException` are all in the build. Play Integrity attests the
@@ -197,32 +197,61 @@ and `GooglePlayIntegrityCheckRpcException` are all in the build. Play Integrity 
 changes that, and nothing here should be read as suggesting otherwise — `README.md` says
 UNIQUE is not an attestation bypass, and that stands.
 
-**But a string in a binary is not a call, and the logs distinguish them.** Across the
-eleventh, thirteenth and fourteenth phone runs, `com.axlebolt.standoff2` binds the Play
-Integrity service **zero** times. Every UNIQUE process logs a cross-app service intent, so
-the absence is measured rather than assumed:
+**A measurement was made here and it was overstated. The correction, first.**
 
-| Bound by the game | Times, in three runs |
+What was written was "the game never binds the Play Integrity service at all", from three
+phone runs. What those runs actually contain:
+
+| Run | Length | How far the game got |
+|---|---|---|
+| 11 | 93 s | launch → login screen → sign-in attempt failed |
+| 13 | 59 s | launch → sign-in attempt failed |
+| 14 | 59 s | launch → sign-in attempt failed |
+
+**No session has ever completed a login.** Every one ends at or before the sign-in refusal,
+and the longest is a minute and a half. Play Integrity in a game is most naturally called
+*after* authentication — with the session, on a match, or on a timer — so a minute of
+pre-login activity says nothing about it. "Never called" was not measured; "not called in
+the first minute of a failed login" was.
+
+**What the evidence does support, stated at its real width.** Across those three runs:
+
+| Bound by the game | Times |
 |---|---|
-| `com.google.android.play.core.expressintegrityservice.BIND_EXPRESS_INTEGRITY_SERVICE` | **0** |
+| `…expressintegrityservice.BIND_EXPRESS_INTEGRITY_SERVICE` | 0 |
 | `com.google.android.gms.safetynet.service.START` | 3 — once per run |
 
-And the single SafetyNet bind is not the anti-cheat calling it. It arrives inside the
-ordinary GMS-common initialisation, milliseconds before
-`com.google.android.gms.usagereporting.service.START`, which is what Firebase and
-Crashlytics do on every start.
+and the single SafetyNet bind arrives inside the ordinary GMS-common initialisation,
+milliseconds before `com.google.android.gms.usagereporting.service.START`, which is what
+Firebase and Crashlytics do on every start.
 
-For contrast, in the same fourteenth log, `com.openai.chatgpt` binds the express-integrity
-service **six** times — and ChatGPT is the app that answers
-`preauth_cookie_device_check_failed`. The distinction shows up in one file, from one
-device, on the same afternoon.
+In the same fourteenth log, at the same stage of its own failed login, `com.openai.chatgpt`
+binds express-integrity **six** times — because its device check is a *pre-auth* one, which
+is what `preauth_cookie_device_check_failed` says. So the narrow, supported claim is:
 
-So the honest position on attestation for *this* game is narrower than "it ships Play
-Integrity, therefore it is out of reach": the plugin is bundled, the code path did not run
-in any observed session, and the verdict the game actually acts on is the server's answer
-to `AppVerification`. That is not proof it never runs — a session that reached further into
-the game might call it — but it is what three runs on real hardware say, and it is the
-opposite of what the string table alone suggests.
+> **Standoff 2 does not gate the sign-in attempt itself on Play Integrity.** Whether it
+> calls Play Integrity after a successful login is unknown and unmeasured, because there
+> has never been a successful login.
+
+**And one argument that was made for this and is wrong.** "A game that hard-required Play
+Integrity would be dead on phones without Google, therefore Standoff 2 cannot require it" —
+Axlebolt ships a **separate build for Huawei AppGallery**. A separate build is exactly how a
+developer hard-requires Google services in the Google Play build without losing that market.
+The argument does not hold and should not be relied on.
+
+### What *is* testable without a login, and is the thing to test
+
+The two virtual-space messages are not the same mechanism, and only one of them needs a
+server. `Anticheat/VirtualSpaceWarning` is set client-side by `AntiCheatManager`, from a
+flag called `VirtualSpaceDetected`, re-evaluated on a timer (`UpdateCoroutine`) — no login,
+no network, no attestation involved. `AuthRestrictions/VirtualSpaceMessage` is the server's
+answer and needs a login to reach.
+
+So the path work has a check that costs nothing and depends on nothing else: **launch the
+game, do not sign in, wait.** If the in-game virtual-space warning stops appearing, the
+client-side detection is closed and that is measured rather than argued. Everything about
+Google, attestation and the server verdict is downstream of a login that has never worked,
+and none of it can be settled before that one.
 
 ---
 

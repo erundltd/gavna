@@ -145,6 +145,8 @@ ssize_t (*o_readlinkat)(int, const char*, char*, size_t) = nullptr;
 int (*o_fchmodat)(int, const char*, mode_t, int) = nullptr;
 char* (*o_realpath)(const char*, char*) = nullptr;
 int (*o_statvfs)(const char*, struct statvfs*) = nullptr;
+int (*o_remove)(const char*) = nullptr;
+int (*o_creat)(const char*, mode_t) = nullptr;
 
 /// Rewrites `path` when a rule matches, otherwise hands back the original pointer.
 ///
@@ -451,6 +453,18 @@ char* h_realpath(const char* path, char* resolved) {
     return answer;
 }
 
+int h_remove(const char* path) {
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    return o_remove != nullptr ? o_remove(target) : ::remove(target);
+}
+
+int h_creat(const char* path, mode_t mode) {
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    return o_creat != nullptr ? o_creat(target, mode) : ::creat(target, mode);
+}
+
 int h_statvfs(const char* path, struct statvfs* out) {
     std::string holder;
     const char* target = rewrite(path, holder);
@@ -615,6 +629,39 @@ InstallStatus install_locked() {
         // `__openat` and `__open_2` are bionic's fortified spellings, emitted when a
         // library is built with `_FORTIFY_SOURCE`. Most of the platform is.
         {"__openat",    reinterpret_cast<void*>(h_openat),       reinterpret_cast<void**>(&o_openat)},
+
+        // The large-file spellings, which are a different *symbol* and were the whole of
+        // the sixteenth run's failure.
+        //
+        // `java.io.File.isFile()` does not reach `libjavacore.so` at all. It reaches
+        // `UnixFileSystem.getBooleanAttributes0`, which is native code in
+        // `libopenjdk.so` — Android's OpenJDK port — and that file is written against
+        // the LFS API:
+        //
+        //     static jboolean statMode(const char *path, int *mode) {
+        //         struct stat64 sb;
+        //         if (stat64(path, &sb) == 0) { ... }
+        //
+        // `stat64` and `stat` are the same function on a 64-bit device and *different
+        // symbols* in a relocation table, so a hook that asks for one never sees the
+        // other. Every write went through `libjavacore.so` and was redirected; the first
+        // thing to ask `stat` about a published path through `libopenjdk.so` was the
+        // code gate, and it was told the file does not exist.
+        //
+        // On LP64 `struct stat` and `struct stat64` are the same layout, so the same
+        // trampolines serve both spellings.
+        {"stat64",      reinterpret_cast<void*>(h_stat),         reinterpret_cast<void**>(&o_stat)},
+        {"lstat64",     reinterpret_cast<void*>(h_lstat),        reinterpret_cast<void**>(&o_lstat)},
+        {"open64",      reinterpret_cast<void*>(h_open),         reinterpret_cast<void**>(&o_open)},
+        {"openat64",    reinterpret_cast<void*>(h_openat),       reinterpret_cast<void**>(&o_openat)},
+        {"fopen64",     reinterpret_cast<void*>(h_fopen),        reinterpret_cast<void**>(&o_fopen)},
+        {"statfs64",    reinterpret_cast<void*>(h_statfs),       reinterpret_cast<void**>(&o_statfs)},
+
+        // And two more the same file uses: `remove` for delete and `creat` for a
+        // truncating create. Neither has an `at` spelling in that code.
+        {"remove",      reinterpret_cast<void*>(h_remove),       reinterpret_cast<void**>(&o_remove)},
+        {"creat",       reinterpret_cast<void*>(h_creat),        reinterpret_cast<void**>(&o_creat)},
+        {"creat64",     reinterpret_cast<void*>(h_creat),        reinterpret_cast<void**>(&o_creat)},
     };
 
     std::vector<std::string> filters;

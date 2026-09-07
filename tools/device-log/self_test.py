@@ -56,6 +56,8 @@ FIXTURE14 = os.path.join(HERE, "fixtures", "redmi-android15-run14.log")
 FIXTURE14_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run14.device.txt")
 FIXTURE15 = os.path.join(HERE, "fixtures", "redmi-android15-run15.log")
 FIXTURE15_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run15.device.txt")
+FIXTURE16 = os.path.join(HERE, "fixtures", "redmi-android15-run16.log")
+FIXTURE16_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run16.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -1000,6 +1002,59 @@ class RedmiRun15Test(unittest.TestCase):
     def test_the_run_fails_on_four_checks(self):
         failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
         self.assertEqual(failing, ["crash", "google", "native", "paths"])
+
+
+class RedmiRun16Test(unittest.TestCase):
+    """The sixteenth run: the scope revert held, and the per-library line named the gap.
+
+    The fifteenth run's native abort is gone — the graphics driver is out of scope again —
+    and so is the datastore crash. The game launches, runs, and shows its own menu. Two
+    checks fail and only one of them is new work.
+
+    What makes this log worth keeping is one line, printed by the diagnostic added two runs
+    earlier for exactly this purpose:
+
+    ```
+    io_redirect installed: 81 slot(s) in 15/389 libraries
+    io_redirect: hooked libjavacore.so=8
+    io_redirect: hooked libsqlite.so=2+abs
+    ```
+
+    Eight slots in `libjavacore.so` is `open`, `stat`, `lstat`, `access`, `mkdir`, `rmdir`,
+    `unlink`, `rename` — every *write* path a guest takes through `java.io`. And the code
+    gate still refused, saying the published APK path does not open.
+
+    Both are true at once because `java.io.File` is two libraries, not one.
+    `File.isFile()`, `length()`, `delete()` and `list()` are `UnixFileSystem`'s **native**
+    methods, and those live in Android's OpenJDK port, `libopenjdk.so`, which was not in
+    scope — and that file is written against the large-file API, so it calls `stat64`,
+    which is a different *symbol* from `stat` in a relocation table even though it is the
+    same function on a 64-bit device.
+
+    So every write was redirected and the first `stat` of a published path was not. That is
+    why the fourteenth run's file probe passed while this run's gate refused: the probe
+    wrote through the public path and read back through the *real* one, and never asked
+    `stat` about a public path at all.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE16, FIXTURE16_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_the_fifteenth_run_s_regressions_are_gone(self):
+        # The native abort in the Mali driver and the datastore failure both came from
+        # hooking the whole process. Neither may come back.
+        for name in ("native", "crash", "launch", "slots", "detection"):
+            self.assertEqual(self.checks[name].verdict, analyze.PASS, name)
+
+    def test_the_code_gate_still_refuses_and_that_is_the_finding(self):
+        detail = findings(self.checks["paths"])
+        self.assertIn("the published APK path does not open", detail)
+
+    def test_only_google_and_paths_fail(self):
+        failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
+        self.assertEqual(failing, ["google", "paths"])
 
 
 HEALTHY = """\

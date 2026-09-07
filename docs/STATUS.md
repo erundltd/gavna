@@ -47,7 +47,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**290 JVM tests, 15 Dart tests, 94 native checks, 119 off-device tool tests — all passing.**
+**290 JVM tests, 15 Dart tests, 94 native checks, 122 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1408,6 +1408,57 @@ marks which libraries got them.
 `code=false` cause is unexplained. If the next run still refuses, the per-library line —
 now uncapped enough to list everything, and marked with which relocation kinds were used —
 says whether `libjavacore.so` got its `stat` patched, and that is the next thing to read.
+
+### The sixteenth run: `java.io.File` is two libraries, not one
+
+The scope revert held. No native abort, no datastore failure, the game launches and shows
+its own menu, `leaked=0`. Two checks fail, `google` and `paths`, and only the second is new
+work.
+
+What makes this log the useful one is a single line, printed by the diagnostic added two
+runs earlier for exactly this:
+
+```
+io_redirect installed: 81 slot(s) in 15/389 libraries
+io_redirect: hooked libjavacore.so=8
+io_redirect: hooked libsqlite.so=2+abs
+```
+
+Eight slots in `libjavacore.so` — `open`, `stat`, `lstat`, `access`, `mkdir`, `rmdir`,
+`unlink`, `rename`, which is every path a guest's `java.io` **writes** through. And the code
+gate still refused: *the published APK path does not open*.
+
+Both are true at once because **`java.io.File` is two libraries.** Writes go through
+`libcore`'s `Os` API in `libjavacore.so`. But `File.isFile()`, `length()`,
+`lastModified()`, `delete()` and `list()` are `UnixFileSystem`'s *native* methods, and
+those live in Android's OpenJDK port — `libopenjdk.so` — which was not in scope. That file
+is written against the large-file API:
+
+```c
+static jboolean statMode(const char *path, int *mode) {
+    struct stat64 sb;
+    if (stat64(path, &sb) == 0) { ... }
+```
+
+and `stat64` is a **different symbol** from `stat` in a relocation table, even though on a
+64-bit device it is the same function.
+
+So every write was redirected and the first `stat` of a published path was not. It also
+explains why the fourteenth run's file probe passed while this gate refuses: the probe wrote
+through the public path and read the result back through the *real* one, and never asked
+`stat` about a public path at all. The gate is the first thing that ever did.
+
+Three changes:
+
+- **`libopenjdk.so` is in the scope**, and the large-file spellings are in the symbol table:
+  `stat64`, `lstat64`, `open64`, `openat64`, `fopen64`, `statfs64`, plus `remove` and
+  `creat`/`creat64`, which the same file uses for delete and truncating create.
+- **The gate distinguishes its three failure modes**, because they produced one message and
+  cost a round. It now asks the native table directly: no rule maps the path; the rule maps
+  it somewhere the file is not; or the rule is right and Java still cannot see it — which
+  names the fault as a missing hook rather than a missing rule, and is what happened here.
+- The fixture and its assertions are checked in, including that the fifteenth run's native
+  abort and datastore failure stay gone.
 
 ### What the thirteenth run settled about signing in, found late
 

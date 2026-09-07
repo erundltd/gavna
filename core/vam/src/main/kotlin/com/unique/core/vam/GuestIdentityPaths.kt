@@ -176,11 +176,26 @@ internal object GuestIdentityPaths {
         // path that resolves nowhere — which surfaced as a game telling its player the
         // device was out of space.
         val slots = runCatching { UniqueNative.redirectSlotsPatched() }.getOrDefault(0)
+        // Three different faults produce the same "it does not open", and the sixteenth
+        // run cost a round because the message could not tell them apart. Asked in order,
+        // each answer rules out one:
+        //
+        //   1. no rule maps the path       — `VirtualPathModel` and the plan disagree
+        //   2. the rule maps it nowhere    — the instance's APK is not where it should be
+        //   3. the rule is right and Java still cannot see it
+        //                                  — the hook is not in the library doing the
+        //                                    asking, which is what actually happened
+        val mapped = runCatching { UniqueNative.redirect(plan.baseApk) }.getOrNull()
         val codeRefusal = when {
             slots <= 0 ->
                 "the redirect patched no slots, so a published path would resolve nowhere"
+            mapped == null ->
+                "no redirect rule maps the published APK path: ${plan.baseApk}"
+            !File(mapped).isFile ->
+                "the rule maps the published APK path to a file that is not there: $mapped"
             !File(plan.baseApk).isFile ->
-                "the published APK path does not open: ${plan.baseApk}"
+                "the rule is right and Java cannot see it: the redirect is missing from " +
+                    "the library that answers File.isFile — ${plan.baseApk} -> $mapped"
             else -> null
         }
         val code = if (codeRefusal != null) false else runCatching {

@@ -64,6 +64,51 @@ install over them.
 
 ## What changed since the last phone run
 
+Хорошая новость: возврат сработал. Никаких падений драйвера, ничего не крашится, игра
+запускается и показывает своё меню — на скриншоте это видно. Осталось два провала, и один
+из них я наконец понял.
+
+**`java.io.File` — это две библиотеки, а не одна.** Диагностика, которую я поставил два
+прогона назад, напечатала ровно ту строку, ради которой ставилась:
+
+```
+io_redirect: hooked libjavacore.so=8
+```
+
+Восемь точек в `libjavacore.so` — это `open`, `stat`, `lstat`, `access`, `mkdir`, `rmdir`,
+`unlink`, `rename`. То есть всё, чем приложение **пишет** через `java.io`. И при этом
+проверка отказалась публиковать путь: «опубликованный путь к APK не открывается».
+
+Оба факта верны одновременно, потому что чтение атрибутов файла — `isFile()`, `length()`,
+`delete()`, `list()` — это **нативные** методы, и живут они в другой библиотеке
+(`libopenjdk.so`, порт OpenJDK внутри Android), которой не было в списке. А написана она
+через «большие» имена функций: она вызывает `stat64`, а не `stat`. На 64-битном телефоне
+это одна и та же функция, но **разные символы** в таблице — перехват одного не видит
+другого.
+
+Поэтому все записи подменялись, а первая же проверка существования опубликованного пути —
+нет. И поэтому проверка из позапрошлой сборки проходила: она писала через публичный путь, а
+читала результат по *настоящему*, и ни разу не спрашивала `stat` про публичный путь. Эта
+проверка была первой, кто спросил.
+
+**Что сделано:** `libopenjdk.so` добавлена в список, и добавлены «большие» имена —
+`stat64`, `lstat64`, `open64`, `openat64`, `fopen64`, `statfs64`, плюс `remove` и `creat`.
+
+И ещё: сообщение об отказе теперь различает три разные причины, которые раньше выглядели
+одинаково — «нет правила для пути», «правило есть, но файла по нему нет», «правило верное, а
+Java всё равно не видит». Последнее — это то, что было, и раньше оно молчало.
+
+### Про «Попытка входа отменена» на скриншоте
+
+Это то же самое, что и раньше, и это ещё не та стена, о которой мы говорили. Запрос входа
+уходит из пространства к Play services телефона, тот отвечает **как UNIQUE**, и игра
+получает отмену. До сервера игры с отчётом об окружении дело пока не доходит.
+
+Порядок от этого не меняется: сначала пути, потом вход. Но теперь ясно, что до таблички про
+виртуальное пространство мы ещё не дошли — а значит и не проверили то, ради чего всё это.
+
+## What changed one run ago
+
 Прошлая сборка сделала хуже, и твой лог говорит чем — одной строкой.
 
 ```
@@ -111,7 +156,7 @@ E CRASH: signal 6 (SIGABRT) … name: RenderThread >>> com.axlebolt.standoff2 <<
 то, ради чего стоит работать, потому что в отличие от аттестации она находится в
 досягаемости.
 
-## What changed one run ago
+## What changed two runs ago
 
 Your log was the most useful one this project has had, and not because things worked. Both
 of the safety checks I built into the last build fired, and one of them was right to.
@@ -253,7 +298,7 @@ uses the native Google API.
 3. Whether the "virtual space" notice appears in Standoff 2 — and whether the
    "not enough memory" one is gone.
 
-## What changed two runs ago
+## What changed three runs ago
 
 **Your last log was the best one yet: seventeen of eighteen checks passed.** The game
 launched, ran, did not crash, and did not die on the sign-in button the way it did before.
@@ -323,7 +368,7 @@ such thing — the only line containing that word was UNIQUE's own explanation o
 *would* happen. A tool that cannot tell its own prediction from a real answer is worse than
 no tool, because both read identically. Fixed, with a test.
 
-## What changed three runs ago
+## What changed four runs ago
 
 **I read the game.** Two passes were spent guessing at what Standoff 2 checks; this time
 the check itself was found, in the shipping build, and it is not what either of us assumed.
@@ -418,7 +463,7 @@ What was new is underneath, and it is worse than the crash:
   the protector changes its mind is a measurement, not a promise — if it still fails, it
   fails for a reason worth reading.
 
-## What changed four runs ago
+## What changed five runs ago
 
 The rewrite from the last build worked — your log shows 17 requests going out under a
 name Google accepts, and the game-files message is gone. What it uncovered is three more
@@ -445,7 +490,7 @@ covered all of them.** The `DEVELOPER_ERROR` is real for a request that reaches 
 UNIQUE. But this crash never reached Google at all. Try signing in on this build and send
 the log: what happens now is something nobody has measured, me included.
 
-## What changed five runs ago
+## What changed six runs ago
 
 - **Google Play services actually works now.** There was one refusal behind every Google
   failure this project has ever had: Play services checks that the calling app's name
@@ -470,7 +515,7 @@ the log: what happens now is something nobody has measured, me included.
   picker reaches, several at once. It is still reachable from an app's own Storage
   section, which opens it directly inside that app.
 
-## What changed six runs ago
+## What changed seven runs ago
 
 Six things were reported. Two of them were mistakes of mine, one was a request, and the
 log had all of them.
@@ -505,7 +550,7 @@ log had all of them.
   services resolves the caller to UNIQUE, so a token comes back for UNIQUE and not for the
   app. Only Play services running *inside* the space can answer that, and it is not built.
 
-## What changed seven runs ago
+## What changed eight runs ago
 
 That log was answered with two words — *"nothing changed"* — and a screenshot of a
 notification asking to install Google Play services. That was fair. The build was
@@ -532,7 +577,7 @@ installed and its new code was running; the code was wrong.
   passed on the log that produced that notification; this is the seventeenth, and it is
   asserted against that same log so the rule cannot come back quietly.
 
-## What changed eight runs ago
+## What changed nine runs ago
 
 Six apps launched in that run and three of them died seconds later, all of the same thing.
 This build answers everything that log reported.
@@ -683,20 +728,20 @@ answer it. Everything else — hardware Vulkan, WebView rendering, Play Integrit
 Billing, Play Games — is still `NOT_TESTED` or `UNSUPPORTED` and stays that way until a run
 says otherwise.
 
-The previous build carried the widest change the engine has ever had — file access in every
-library of every app — and it broke the graphics driver on this phone. This build takes that
-back out and replaces it with a named list. Whether the list is the right length is the open
-question, and the last build's own diagnostics are what will answer it.
+The list of libraries whose file access is redirected has now been wrong in three different
+directions — too narrow, then everything, then narrow again but missing the one that answers
+`File.isFile()`. Each was corrected from a phone log rather than from reasoning, and the
+current list may still be short by a name. What is different now is that the engine says
+which name, instead of failing silently.
 
 What would help most from the next log, in order:
 
-1. **Whether the game stops crashing on the render thread.** That is what the last build
-   broke and what this one takes back out.
-2. **`GUEST_PATHS_PUBLISHED … code=true`**, and no `paths` failure. `data=false` is still
-   the expected state and is not a fault.
-3. **`io_redirect: hooked <library>=<n>`** — one line per library. If the path still does
-   not open, that list is what says which library is missing its redirect.
-4. **Whether apps you already had still have their data.** Open two or three with something
+1. **`GUEST_PATHS_PUBLISHED … code=true`**, and no `paths` failure. That is the whole point
+   of this build. If it still refuses, the message now says which of three things is wrong
+   instead of one word for all three.
+2. **Whether apps you already had still have their data.** Open two or three with something
    saved in them before the game.
-5. **Whether the "virtual space" notice still appears**, and whether "not enough memory"
-   is gone.
+3. **Whether the "virtual space" notice appears**, and what it lets you do — continue
+   playing, or back to the login screen. Those are two different messages in the game and
+   knowing which one it is matters.
+4. `io_redirect: hooked <library>=<n>`, still — it is the line that found this one.

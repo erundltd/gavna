@@ -1098,6 +1098,16 @@ object AppBootstrap {
     private val PLATFORM_IO_LIBRARIES = listOf(
         // Java file IO: `File`, every stream, every `SharedPreferences` write.
         "libjavacore.so",
+        // And the other half of `java.io`, which is not the same library.
+        //
+        // `File.isFile()`, `length()`, `lastModified()`, `delete()`, `list()` and
+        // `createNewFile()` are `UnixFileSystem`'s native methods, and those live in
+        // Android's OpenJDK port rather than in libcore. The sixteenth run is what that
+        // cost: every *write* through `java.io.File` was redirected, because writes go
+        // through `libjavacore.so`, and the first `stat` of a published path — the code
+        // gate's own check — was answered from the real filesystem, where the path does
+        // not exist. The engine then correctly refused to publish it.
+        "libopenjdk.so",
         // A database, opened by absolute path. Also the one library where absolute data
         // relocations are patched — see `io_redirect.cpp`.
         "libsqlite.so",

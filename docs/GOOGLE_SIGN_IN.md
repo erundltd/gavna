@@ -7,14 +7,26 @@ is installed normally?**
 The answer depends entirely on *who is asked to vouch for the app's identity*, and there
 are two answers, not one:
 
-| The SDK asks | Example | Can UNIQUE answer? |
+| The SDK asks | Example | Where UNIQUE stands |
 |---|---|---|
-| **Play services** — another process, resolving the caller by kernel uid | Google Sign-In | **No.** Not on an unrooted phone, not ever, without in-space GMS (§2) |
-| **the app's own `PackageManager`** | Facebook, VK, most SDKs | **Yes, already** — proven on the phone in §3 |
+| **Play services** — another process, resolving the caller by kernel uid | Google Sign-In | Not through the route UNIQUE takes today. **Not proven impossible** — see the note below |
+| **the app's own `PackageManager`** | Facebook, VK, most SDKs | **Already correct** — proven on the phone in §3 |
 
-So "you cannot sign in inside a virtual space" is false as a general statement. For
-Standoff 2 specifically, the realistic route to a working login is Facebook or VK, not
-Google, and §3 has the evidence and the one piece of work it still needs.
+> **A claim made here was too strong, and is withdrawn.** This document said Google sign-in
+> from a virtual space could not work "ever, on an unrooted phone". The user reports that
+> in other virtual spaces on this game the account picker returns, the login completes and
+> the game loads — what appears afterwards is the virtual-space notice, not a sign-in
+> failure. One person's account of an app is not a measurement, but it is evidence, and it
+> is more evidence than the reasoning it contradicts. §1 describes accurately what UNIQUE's
+> own route does and why it fails; it does not establish that no route exists, and the
+> difference matters. **How another engine gets a Google sign-in through is now the most
+> valuable unknown in this file**, and it is answerable: one log from such an engine, doing
+> a sign-in that works, would show the route.
+
+So "you cannot sign in inside a virtual space" is false as a general statement, and may be
+false even for Google. For Standoff 2 the shortest route UNIQUE can build today is Facebook
+or VK (§3) — but the thing that actually stops the game being playable is what comes
+*after* the login, not the login.
 
 ---
 
@@ -58,7 +70,15 @@ So there are two different walls, and they are often confused:
 
 The second one is not a check UNIQUE participates in. It happens in another process, against
 records in `system_server`. There is no hook, no rewrite and no permission that reaches it
-on an unrooted device.
+on an unrooted device — **by this route**. What is described above is what UNIQUE does:
+the sign-in intent leaves the space (`ACTIVITY_IMPLICIT_LEFT_GUEST … handledByHost=
+com.google.android.gms` in every run), the host's Play services answers it as UNIQUE, and a
+token for UNIQUE is no use to the game's server.
+
+That is a description of one route failing, not a proof that every route fails, and the
+note at the top of this file says why the distinction now matters. Two things that would be
+worth knowing and are not known: whether the game asks for an ID token at all or only for
+the account, and what an engine that does get through actually does differently.
 
 ---
 
@@ -176,22 +196,25 @@ through a browser.
 
 It does **not** help Google sign-in, which never opens a browser.
 
-### The other half, which comes first
+### The other half, which comes first — and is the real blocker
 
 Every auth request shape in Standoff 2's binary — `GoogleAuthRequest`, `VkAuthRequest`,
 `FacebookAuthRequest`, `GameCenterAuthRequest`, `TestAuthRequest` — carries the same
 `AppVerification` report (`docs/STANDOFF2.md`). So the virtual-space verdict is **not**
-specific to Google: a Facebook login would be refused by Axlebolt's server for the same
-reason a Google one would, if the report still says the APK lives under `com.unique`.
+specific to Google, and a Facebook login would meet it for the same reason.
 
-The order therefore is not a preference, it is a dependency:
+The user's account of the game settles which of the two walls actually decides
+playability: **the sign-in completes, the game loads, and then the notice appears.** So in
+a virtual space that gets a login through, the login is not what stops the game — this is.
 
-1. Close the virtual-space verdict — `GuestIdentityPaths`, in progress, measured on the
-   next run.
-2. Then the in-space browser, which makes a Facebook or VK login able to complete.
+The order is therefore a dependency and not a preference:
 
-Doing the second first would produce a login that reaches the server and is refused, and
-nothing would be learned from it.
+1. Close the virtual-space verdict — `GuestIdentityPaths`, written, waiting on a phone.
+2. Then the login route, whichever proves cheapest to build.
+
+Doing the second first produces a login that completes and a game that then refuses, which
+is exactly the state other engines are already in, and nothing is learned from reaching it
+a second time.
 
 ---
 

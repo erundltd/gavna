@@ -239,19 +239,34 @@ Axlebolt ships a **separate build for Huawei AppGallery**. A separate build is e
 developer hard-requires Google services in the Google Play build without losing that market.
 The argument does not hold and should not be relied on.
 
-### What *is* testable without a login, and is the thing to test
+### When the notice actually appears, from someone who has seen it
 
-The two virtual-space messages are not the same mechanism, and only one of them needs a
-server. `Anticheat/VirtualSpaceWarning` is set client-side by `AntiCheatManager`, from a
-flag called `VirtualSpaceDetected`, re-evaluated on a timer (`UpdateCoroutine`) — no login,
-no network, no attestation involved. `AuthRestrictions/VirtualSpaceMessage` is the server's
-answer and needs a login to reach.
+Written here from the user's own account of the game's behaviour, because it is the only
+observation of the notice that exists — no session inside UNIQUE has ever reached it:
 
-So the path work has a check that costs nothing and depends on nothing else: **launch the
-game, do not sign in, wait.** If the in-game virtual-space warning stops appearing, the
-client-side detection is closed and that is measured rather than argued. Everything about
-Google, attestation and the server verdict is downstream of a login that has never worked,
-and none of it can be settled before that one.
+> the notice appears **after** signing in — a Google account is chosen, or a Facebook login
+> completes, the game loads, and then the notice comes up.
+
+Two consequences, and a retraction.
+
+**The retraction.** A previous version of this section proposed testing the path work by
+launching the game and *not* signing in, on the theory that
+`Anticheat/VirtualSpaceWarning` is client-side and runs on a timer. That test is worthless:
+the notice does not appear before a login, so a run without one proves nothing either way.
+
+**The notice is post-authentication**, which is what `AppVerification` being a field of
+`GoogleAuthRequest` predicts. The report travels *with* the credential; the server reads
+`Path`, `ApkHash`, `ApkFiles`, `AppSnapshot` and the rest, and answers. Whether what the
+player sees is the server's `AuthRestrictions/VirtualSpaceMessage` or the client's
+`Anticheat/VirtualSpaceWarning` firing once the main menu exists cannot be told apart from
+the outside — the distinguishing question is whether the game can still be played
+afterwards. Either way the path work is aimed at the right thing, because the client flag
+and the server report read the same four getters.
+
+**And the login itself evidently completes elsewhere.** The account picker returns, the
+game loads. So a virtual space *can* get through a Google or Facebook sign-in on this game;
+what it then hits is this notice. That is the wall worth spending on, and it is the one
+UNIQUE is already closing.
 
 ---
 

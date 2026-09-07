@@ -18,6 +18,7 @@
 #include "plt_hook.h"
 #include "proc_view.h"
 #include "sqlite_vfs.h"
+#include "syscall_paths.h"
 #include "redirect_table.h"
 #include "unique_native.h"
 
@@ -155,6 +156,9 @@ ssize_t (*o_readlinkat_chk)(int, const char*, char*, size_t, size_t) = nullptr;
 // outright; `statx` is the modern `stat` a recent libc++ `std::filesystem` reaches for.
 FILE* (*o_freopen)(const char*, const char*, FILE*) = nullptr;
 int (*o_statx)(int, const char*, int, unsigned int, void*) = nullptr;
+
+// The one an engine reaches for when it does not want libc at all. See syscall_paths.h.
+long (*o_syscall)(long, ...) = nullptr;
 int (*o_faccessat)(int, const char*, int, int) = nullptr;
 int (*o_mkdirat)(int, const char*, mode_t) = nullptr;
 int (*o_unlinkat)(int, const char*, int) = nullptr;
@@ -398,6 +402,57 @@ int h_statx(int dirfd, const char* path, int flags, unsigned int mask, void* out
     std::string holder;
     const char* target = rewrite(path, holder);
     return o_statx != nullptr ? o_statx(dirfd, target, flags, mask, out) : -1;
+}
+
+/// Rewrites a `readlink`-style answer through the outward view. Defined further down,
+/// beside the other `*at` trampolines; declared here because the syscall path reaches it
+/// first.
+ssize_t view_readlink_result(char* buf, ssize_t n, size_t size);
+
+/// `syscall()`, with the path argument rewritten for the numbers that have one.
+///
+/// Standoff 2's engine imports two of the forty-one libc names in the table — `realpath`
+/// and `readlink` — and neither of them opens a file. It issues its file operations as raw
+/// syscalls, which is why every path hook redirected nothing for it and why the game could
+/// not open the APK path UNIQUE had published to it. `syscall_paths.h` has the run that
+/// established this and the table.
+///
+/// Six arguments are always read and always forwarded. On AAPCS64 the variadic arguments
+/// live in registers, so reading one the caller did not pass yields a register value that
+/// is then handed on unchanged — the kernel takes only as many as the number needs. What
+/// must not happen is *work* on a number that carries no path: `futex` is most of what a
+/// game's threads issue, and it is answered here by one comparison and a forward, without
+/// touching the redirect table's lock. That is also what keeps this out of a deadlock with
+/// the lock's own futex.
+long h_syscall(long number, ...) {
+    va_list args;
+    va_start(args, number);
+    long a[6];
+    for (long& value : a) value = va_arg(args, long);
+    va_end(args);
+
+    const auto path_args = syscall_paths::path_arguments(number);
+    if (!path_args.any()) {
+        return o_syscall != nullptr ? o_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
+                                    : -1;
+    }
+
+    std::string first_holder, second_holder;
+    a[path_args.first] = reinterpret_cast<long>(
+            rewrite(reinterpret_cast<const char*>(a[path_args.first]), first_holder));
+    if (path_args.second != syscall_paths::PathArguments::kNone) {
+        a[path_args.second] = reinterpret_cast<long>(
+                rewrite(reinterpret_cast<const char*>(a[path_args.second]), second_holder));
+    }
+    const long result = o_syscall != nullptr
+            ? o_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
+            : -1;
+    // `readlinkat` answers with a path, and under `/proc/self/fd` that path names UNIQUE.
+    if (result > 0 && syscall_paths::answers_with_a_path(number)) {
+        return view_readlink_result(reinterpret_cast<char*>(a[2]), result,
+                                    static_cast<size_t>(a[3]));
+    }
+    return result;
 }
 
 int h_statfs(const char* path, struct statfs* out) {
@@ -888,6 +943,7 @@ InstallStatus install_locked() {
         {"freopen",     reinterpret_cast<void*>(h_freopen),      reinterpret_cast<void**>(&o_freopen)},
         {"freopen64",   reinterpret_cast<void*>(h_freopen),      reinterpret_cast<void**>(&o_freopen)},
         {"statx",       reinterpret_cast<void*>(h_statx),        reinterpret_cast<void**>(&o_statx)},
+        {"syscall",     reinterpret_cast<void*>(h_syscall),      reinterpret_cast<void**>(&o_syscall)},
         {"creat",       reinterpret_cast<void*>(h_creat),        reinterpret_cast<void**>(&o_creat)},
         {"creat64",     reinterpret_cast<void*>(h_creat),        reinterpret_cast<void**>(&o_creat)},
     };

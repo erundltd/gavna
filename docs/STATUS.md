@@ -53,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**302 JVM tests, 15 Dart tests, 145 native checks (41 of them need an NDK and skip without one), 156 off-device tool tests — all passing.**
+**302 JVM tests, 15 Dart tests, 175 native checks (42 of them need an NDK and skip without one), 159 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1793,6 +1793,56 @@ Three names were added on the way, from a diff of the table against bionic's own
 path-taking functions rather than from a guess about Unity: `freopen`, `freopen64` — which
 open a path outright — and `statx`, the modern `stat` a recent libc++ `std::filesystem`
 reaches for. `tools/native-test/check_libc_symbols.py` covers all forty-one.
+
+### The twenty-third run: the engine does not use libc, and one line said so
+
+The diagnostic added for exactly this printed for the first time:
+
+```
+io_redirect: symbols libunity.so patched=realpath,readlink
+             unhooked=pthread_setspecific,…,syscall,…
+```
+
+**Two names out of forty-one, and neither of them opens anything.** There is no `open`, no
+`openat`, no `stat`, no `fopen` in `libunity.so` at all. Unity issues its file operations
+as **raw `syscall()` calls**.
+
+That is the whole of it. Every path function UNIQUE has ever added to the table — the
+fortified spellings, the large-file spellings, the `*at` family, `freopen`, `statx` — was
+correct and irrelevant for this library, because the library calls none of them. It is why
+`libunity.so=2` was true and useless for four runs, and why the game kept being handed an
+installed-shaped APK path it could not open:
+
+```
+E Unity: ApkAddCentralDirectory : Unable to open '/data/app/~~…/base.apk'
+```
+
+**And the data had been in every scan since the first one.** The relocation being examined
+carries the symbol name; nothing had ever printed it. Four rounds ended in a guess about
+how Unity opens a file, and each guess cost a phone run. `libunity.so=2` and
+`libunity.so patched=realpath,readlink unhooked=…,syscall,…` are the same scan.
+
+**The fix.** `syscall` is hooked, and the path argument is rewritten for the numbers that
+have one. `core/native/…/syscall_paths.h` is that table, with a host-side test:
+
+- arm64 uses the generic syscall ABI, so the path-taking calls are the `*at` family and
+  three others — there is no `SYS_open`, `SYS_stat` or `SYS_access` at all. The list is
+  short and every position is fixed by the kernel ABI.
+- `renameat` and `renameat2` carry two paths; nothing else here carries more than one.
+- `readlinkat` *answers* with a path, so its result goes through the outward view like
+  every other `readlink`.
+- **Everything else is one comparison and a forward.** `futex` is most of what a game's
+  threads issue, and doing any work for it — including taking the redirect table's lock,
+  whose own implementation uses `futex` — is how a hook in this position deadlocks a
+  process. The table is what keeps that to a `switch` with no default work.
+
+Six arguments are always read and always forwarded. On AAPCS64 the variadic arguments are
+in registers, so reading one the caller did not pass yields a register value that is handed
+on unchanged, and the kernel takes only as many as the number needs.
+
+`syscall_paths_test.cpp` pins the positions, including the two that would be expensive to
+confuse: `fstat` and `ftruncate` take a *descriptor* where their `*at` siblings take a
+path, and naming an argument that is not a path would hand the kernel a rewritten integer.
 
 ### Signing in: the refusal happens before the account picker, and that is measurable
 

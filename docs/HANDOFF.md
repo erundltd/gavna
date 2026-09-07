@@ -60,7 +60,7 @@ exist because a claim was made without evidence and a later phone log contradict
 - `/proc/self/maps` inside a guest no longer names UNIQUE — `PROC_VIEW_INSTALLED …
   named=16 leaked=0` on the phone, and the graft checks its own work.
 - Two instances of one app have separate identities, storage and `ANDROID_ID`.
-- 302 JVM tests, 145 host-side native checks, 139 device-log tests, 17 APK-survey tests, 15
+- 302 JVM tests, 175 host-side native checks, 142 device-log tests, 17 APK-survey tests, 15
   Dart tests. All passing.
 
 ### Does not work
@@ -90,9 +90,9 @@ The NDK is installed by Gradle on first native build. AGP 8.13.0, Kotlin 2.2.20.
 
 ```bash
 ./gradlew test                    # 302 JVM tests
-./tools/native-test/run.sh        # 145 native checks; 41 need an NDK and skip without one
+./tools/native-test/run.sh        # 175 native checks; 42 need an NDK and skip without one
 (cd ui && flutter test)           # 15 Dart tests
-./tools/device-log/self_test.py   # 139 tests for the log analyzer, no toolchain
+./tools/device-log/self_test.py   # 142 tests for the log analyzer, no toolchain
 ./tools/apk-survey/self_test.py   # 17 tests
 ./tools/check-translations.py     # every engine failure has both languages
 ./tools/report-unimplemented.sh   # every deliberately unimplemented surface
@@ -343,6 +343,7 @@ This is where most of the recent work happened and where the next bug will proba
 | − the plain `dlopen` hook | 20 | the game died in `UnityPlayer.loadNative`: hooking `dlopen` moves the *caller* and therefore the linker namespace, so a bare soname stops resolving. A regression from the run-18 watch re-arm, and it was in run 19 too |
 | + `dlopen` again, through `__loader_dlopen` with the caller preserved | 21 | without the hook nothing notices `libmain.so` loading `libunity.so`, so the engine is never redirected and cannot open its own APK. Both ends of one fact |
 | — | 22 | it worked: no tombstone, a rescan on the load, `libunity.so=2`. And two of thirty-eight names is all the log said, so the scan reports the *names* now |
+| + `syscall`, with the path argument rewritten | 23 | `libunity.so patched=realpath,readlink unhooked=…,syscall,…` — Unity imports no way of opening a file. It issues raw syscalls, which is why every path hook redirected nothing for it. `syscall_paths.h` |
 
 **The lesson from run 15, which is the important one**: the safety argument ("no rule can
 match `/data/user/0/com.unique`, so a hooked library touching UNIQUE's files is unaffected")
@@ -389,6 +390,31 @@ app's linker namespace refuses to `dlopen`, by walking the loaded library's own 
 Read `sqlite=<n>` on `IO_REDIRECT_INSTALLED` and on `GUEST_PATHS_PUBLISHED`. Zero with a
 database refusal is now a `paths` failure rather than a note, and `+packed` on the
 per-library line confirms or retracts the premise above directly.
+
+### A library can reach the filesystem without importing one libc name
+
+Standoff 2's engine does. Twenty-three runs in, the scan finally printed what
+`libunity.so` actually imports:
+
+```
+io_redirect: symbols libunity.so patched=realpath,readlink
+             unhooked=pthread_setspecific,…,syscall,…
+```
+
+Two names out of forty-one, and neither opens anything. No `open`, no `openat`, no `stat`,
+no `fopen`. **Unity issues its file operations as raw `syscall()` calls**, so every path
+function in the table was correct and irrelevant for it, and `libunity.so=2` was true and
+useless for four runs while each round guessed at how the engine opens a file.
+
+`syscall` is hooked now and the path argument is rewritten per number —
+`core/native/…/syscall_paths.h`, with a host-side test. Read that file before touching it:
+the two ways to get the table wrong are naming an argument that is not a path, which hands
+the kernel a rewritten integer, and doing *any* work for a number that carries none, which
+puts the redirect table's lock in front of every `futex` a thread takes.
+
+**The rule this leaves behind**: when a published path does not open for a guest, read
+`io_redirect: symbols <library>` before adding anything to the table. `=2` says how many
+matched; only the names say whether the library uses libc at all.
 
 ### Hooking `dlopen`: both ways are wrong, and the third way is what `dlopen` does
 
@@ -494,7 +520,7 @@ phone run is checked in as a fixture under `tools/device-log/fixtures/` with ass
 `self_test.py`, so **a check that stops reporting a fault a real phone produced is a
 regression in the tool** rather than progress in the engine.
 
-Twenty captures are checked in — the first run, then runs 4 through 22; runs 2 and 3
+Twenty-one captures are checked in — the first run, then runs 4 through 23; runs 2 and 3
 predate the analyzer and were never kept. When a new log arrives:
 
 1. run the analyzer;
@@ -509,16 +535,18 @@ predate the analyzer and were never kept. When a new log arrives:
 
 ## 8. What to do next, in order
 
-1. **The twenty-third run**, and it is a measurement rather than a hope. Run 22 closed the
-   loader problem from both ends — no tombstone, a rescan on the load, `libunity.so=2` —
-   and the engine still cannot open the APK. What to read, in order:
-   - `io_redirect: symbols libunity.so patched=… unhooked=…`. The second list is the
-     answer: a file operation the engine imports that the table does not hook is, by
-     elimination, the call that opens the APK. Add it and the fault is closed.
-   - Whether `E Unity: ApkAddCentralDirectory : Unable to open` is gone anyway — `freopen`,
-     `freopen64` and `statx` went in with this build, from a diff against bionic's own
-     exports rather than a guess.
-   - No `JNI FatalError … libunity.so` tombstone, which is run 20's failure returning.
+1. **The twenty-fourth run**, which is the first with an actual diagnosis behind it rather
+   than a narrowing. Run 23 said Unity reaches the filesystem through `syscall()` alone;
+   `syscall` is hooked now. What to read, in order:
+   - **No `E Unity: ApkAddCentralDirectory : Unable to open`**, and no "Not enough storage
+     space" dialog. That is the whole of what this build is for.
+   - `io_redirect: symbols libunity.so patched=realpath,readlink,syscall` — `syscall` in
+     the *patched* list is the hook reaching the engine. Its absence means the engine's
+     `syscall` slot was not found, and nothing downstream matters.
+   - Nothing new breaking: `syscall` sits in front of every `futex` a thread takes, so a
+     hang or a deadlock in any app is this change and should be reported as such.
+   - Then, if the game reaches its menu: whether the virtual-space notice appears, and the
+     Google sign-in.
    - **No `JNI FatalError … libunity.so` tombstone.** That is what the `dlopen` hook
      removal is for, and the `crash` check reads the tombstone now rather than only
      `AndroidRuntime`.

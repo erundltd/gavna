@@ -70,6 +70,8 @@ FIXTURE21 = os.path.join(HERE, "fixtures", "redmi-android15-run21.log")
 FIXTURE21_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run21.device.txt")
 FIXTURE22 = os.path.join(HERE, "fixtures", "redmi-android15-run22.log")
 FIXTURE22_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run22.device.txt")
+FIXTURE23 = os.path.join(HERE, "fixtures", "redmi-android15-run23.log")
+FIXTURE23_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run23.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -1518,6 +1520,50 @@ class RedmiRun22Test(unittest.TestCase):
         text = "\n".join(line.message for line in self.parsed.lines)
         self.assertIn("hooked libunity.so=", text)
         self.assertIn("linker dlopen located", text)
+
+
+class RedmiRun23Test(unittest.TestCase):
+    """The twenty-third run: the engine does not use libc, and the log finally said so.
+
+    One line, added for exactly this and printing for the first time:
+
+    ```
+    io_redirect: symbols libunity.so patched=realpath,readlink
+                 unhooked=pthread_setspecific,…,syscall,…
+    ```
+
+    Two names out of forty-one, and neither of them opens anything. There is no `open`, no
+    `openat`, no `stat`, no `fopen` in `libunity.so` at all. **Unity issues its file
+    operations as raw `syscall()` calls** — which is why every path hook UNIQUE has ever
+    added redirected nothing for it, why `libunity.so=2` was true and useless for four
+    runs, and why the game kept being handed an APK path it could not open.
+
+    Four rounds ended in a guess about how Unity opens a file. This is the log that stopped
+    that, and it did so with data that had been available in every scan since the first one
+    — the relocation being examined carries the symbol name; nothing had ever printed it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE23, FIXTURE23_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_the_engine_imports_no_way_of_opening_a_file(self):
+        text = "\n".join(line.message for line in self.parsed.lines)
+        self.assertIn("symbols libunity.so patched=realpath,readlink", text)
+        # The absence is the finding. If a later Unity does import one of these, the
+        # diagnosis in `syscall_paths.h` needs re-reading rather than trusting.
+        symbols = [l.message for l in self.parsed.lines if "symbols libunity.so" in l.message]
+        self.assertTrue(symbols)
+        for name in ("open", "fopen", "stat"):
+            self.assertNotIn(f"patched={name}", symbols[0])
+
+    def test_syscall_is_what_it_uses_instead(self):
+        symbols = [l.message for l in self.parsed.lines if "symbols libunity.so" in l.message]
+        self.assertIn("syscall", symbols[0].split("unhooked=", 1)[1])
+
+    def test_the_published_apk_is_still_unopenable_and_that_is_the_consequence(self):
+        self.assertIn("did not resolve for Unity", findings(self.checks["paths"]))
 
 
 PUBLISHED_THEN_UNOPENABLE = """\

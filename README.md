@@ -39,9 +39,9 @@ never written as `SUPPORTED` because something ought to work.
 
 | | |
 |---|---|
-| **Off-device tests** | 302 JVM tests, 145 native checks, 15 Dart tests, 156 tool tests — all passing |
+| **Off-device tests** | 302 JVM tests, 175 native checks, 15 Dart tests, 159 tool tests — all passing |
 | **On-device suite** | **46 of 46** instrumented tests pass, on an Android 14 x86_64 emulator |
-| **On a real phone** | Twenty-two runs. **The eleventh ran a game to its own login screen and took a touch on it** — Standoff 2, Unity 6 on IL2CPP, its expansion file read out of the instance's own storage, FMOD, Firebase and AppMetrica all up, drawing at 2400×1080 on the hardware renderer. **The eighteenth is the first in which both halves of a guest's own identity were published and round-tripped** (`code=true data=true sqlite=8`) — and the same run is the one in which the game could not open the APK path it had been handed, and said so on screen. The nineteenth published both halves for two apps and found the same fault in the data half, in WebView's renderer. Every fix since is on the same theme: a published path is only a path for the libraries the redirect reaches, and each run names the next one. None of them, nor the Google sign-in handoff, is back on hardware yet |
+| **On a real phone** | Twenty-three runs. **The eleventh ran a game to its own login screen and took a touch on it** — Standoff 2, Unity 6 on IL2CPP, its expansion file read out of the instance's own storage, FMOD, Firebase and AppMetrica all up, drawing at 2400×1080 on the hardware renderer. **The eighteenth is the first in which both halves of a guest's own identity were published and round-tripped** (`code=true data=true sqlite=8`) — and the same run is the one in which the game could not open the APK path it had been handed, and said so on screen. The nineteenth published both halves for two apps and found the same fault in the data half, in WebView's renderer. Every fix since is on the same theme: a published path is only a path for the libraries the redirect reaches, and each run names the next one. None of them, nor the Google sign-in handoff, is back on hardware yet |
 | **Real applications** | Seven from F-Droid — Termux, Fossify Gallery, NewPipe, Shattered Pixel Dungeon, AntennaPod, KeePassDX, Aegis — imported and launched on the emulator. All seven reach their own main activity on the hardware renderer; seven faults were fixed to get there, none of which the probe could have found |
 
 **A virtual app has now run to a usable screen on physical hardware.** Every earlier
@@ -204,7 +204,7 @@ Three build types, and the difference matters:
 
 ```bash
 ./gradlew test                    # 302 JVM tests
-./tools/native-test/run.sh        # 145 native checks; 41 need an NDK and skip without one
+./tools/native-test/run.sh        # 175 native checks; 42 need an NDK and skip without one
 (cd ui && flutter test)           # 15 Dart tests
 ./tools/device-log/self_test.py   # 105 tests for the device-log analyzer, no toolchain
 ./tools/apk-survey/self_test.py   # 17 tests for the APK survey, no toolchain

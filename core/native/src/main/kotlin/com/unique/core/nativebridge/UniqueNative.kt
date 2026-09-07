@@ -178,6 +178,23 @@ object UniqueNative {
     fun redirectSlotsPatched(): Int = if (loaded) nativeRedirectSlotsPatched() else 0
 
     /**
+     * Entries of SQLite's own syscall table redirected, which no GOT patch can do.
+     *
+     * SQLite stores libc *addresses* in a static table rather than calling them, so a
+     * hook that patches calls redirects half of one library — the fourteenth phone run,
+     * where the probe database was created inside the instance and then looked for at the
+     * path the guest had been handed. The answer written for that patched absolute data
+     * relocations; the seventeenth run showed it reaching nothing, because Android links
+     * its platform libraries with packed relocations and there is no array to walk.
+     *
+     * This is the count from the mechanism that replaced it: `sqlite3_vfs.xSetSystemCall`,
+     * which is SQLite's own interface for the purpose and does not care how the library
+     * was linked. Zero means a guest's databases reach the real filesystem, and
+     * `GuestIdentityPaths` refuses to publish the data path when it does.
+     */
+    fun sqliteCallsReplaced(): Int = if (loaded) nativeSqliteCallsReplaced() else 0
+
+    /**
      * Keeps the interception current as the guest loads more libraries.
      *
      * The initial hook walks what is loaded at that moment, so a library loaded later has
@@ -244,6 +261,7 @@ object UniqueNative {
     @JvmStatic private external fun nativeSetRedirectExclusions(paths: Array<String>)
     @JvmStatic private external fun nativeRedirectExclusionCount(): Int
     @JvmStatic private external fun nativeRedirectSlotsPatched(): Int
+    @JvmStatic private external fun nativeSqliteCallsReplaced(): Int
     @JvmStatic private external fun nativeWatchLibraryLoads(): Int
     @JvmStatic private external fun nativeInstallIoRedirect(): Int
     @JvmStatic private external fun nativeSetProperty(key: String, value: String)

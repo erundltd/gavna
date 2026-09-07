@@ -34,7 +34,9 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Virtual path contract | 12 | Every accessor and every alias pinned |
 | Native redirect table (C++) | 34 checks | Host-side binary, no device needed |
 | The two path tables are inverses (C++) | 27 checks | Every path a guest is handed round-trips; no rule can match UNIQUE's own files |
-| The relocation a GOT hook must patch | 2 checks | Taking the address of a libc function compiles to an absolute, zero-addend data relocation — the case SQLite uses and the hook used to skip |
+| The relocation a GOT hook must patch | 2 checks | Taking the address of a libc function compiles to an absolute, zero-addend data relocation — the case SQLite uses. The seventeenth run showed the patch never reaching it on a platform library; see `sqlite_vfs.h` |
+| Finding a symbol in a library that cannot be `dlopen`ed (C++) | 10 checks | Against a real linker's output and against `dlsym`'s answer for the same name — the walk that reaches SQLite's own VFS interface |
+| The Google sign-in handoff | 10 | Which field is rewritten and which is left alone, that a static field is never one, and that a request for a server token is reported before Google answers |
 | Signature-agnostic shim engine | 12 | Includes one shim bound to two different signatures, and conditional `proceed()` |
 | Settings screens a guest opens about itself | 6 | Which half of the intent names the app, and every case that must be left alone |
 | Device profile model | 9 | Shape, stability, regeneration, RFC 4122 |
@@ -51,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**290 JVM tests, 15 Dart tests, 94 native checks, 122 off-device tool tests — all passing.**
+**300 JVM tests, 15 Dart tests, 104 native checks, 135 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1464,6 +1466,132 @@ Three changes:
 - The fixture and its assertions are checked in, including that the fifteenth run's native
   abort and datastore failure stay gone.
 
+### The seventeenth run: the code paths held, and the SQLite fix had never run
+
+The first log in which a guest was handed installed-shaped paths for its own APK and they
+resolved:
+
+```
+GUEST_PATHS_PUBLISHED package=com.axlebolt.standoff2 code=true slots=102 data=false
+    apk=/data/app/~~kx_uUO_2M6FP3W-o_gj5uw/com.axlebolt.standoff2-kROpHz2y_eD6hTS9Y0RvGQ
+```
+
+`code=true` is what the sixteenth run's `libopenjdk.so` and `stat64` work was for, and it
+held on hardware. Three launches, three activities, no crash, `leaked=0` for both guests,
+the game to its own menu. Nothing the fifteenth or sixteenth run fixed regressed.
+
+**Then the data half refused with the fourteenth run's message, in a build that was
+supposed to have closed it.**
+
+```
+I UniqueNative: io_redirect: hooked libsqlite.so=2+abs
+W SQLiteLog: (28) file renamed while open: /data/data/…/.unique-path-probe.db
+E SQLiteLog: (1802) statement aborts at 29: [CREATE TABLE …] disk I/O error
+W LAUNCH GUEST_PATHS_PUBLISHED … data=false
+    detail=a database cannot be opened through the public path: SQLITE_IOERR_FSTAT
+```
+
+**A claim made after the fourteenth run is retracted.** That run's section says
+`R_AARCH64_ABS64` with a zero addend "is patched now", and the sixteenth run's per-library
+line was read as confirming it. It was not. `libsqlite.so=2+abs` is two patched slots and
+`+abs` names an *attempt*: it says absolute relocations were enabled for this library, not
+that any were found. Two is the PLT count on its own — `posixOpen` reaching `open`, and
+nothing else — and every one of SQLite's other file operations is a pointer in
+`aSyscall[]` that the scan never saw.
+
+It never saw them because **Android links its platform libraries with packed relocations.**
+`--pack-dyn-relocs` replaces `DT_RELA` with an APS2 blob under `DT_ANDROID_RELA`, and
+`read_dynamic` reads `DT_RELA`. A library linked that way reports, in every number the scan
+produces, as a library with no data relocations at all. The mechanism was right about
+SQLite and wrong about the file format, and no log before this one could have said so,
+because "patched nothing" and "there was nothing to patch" printed the same number.
+
+The fix does not argue with the format. SQLite publishes an interface for exactly this
+problem — `sqlite3_vfs.xSetSystemCall`, version 3 — which replaces an entry of `aSyscall`
+by name and reaches every use of it, however the library was linked. Reaching that
+interface needs the address of `sqlite3_vfs_find` in a library an app is not allowed to
+`dlopen`, which `core/native/…/elf_symbols.h` reads out of the loaded library's own
+`.dynsym`; both hash-table shapes are handled, because the table carries no length of its
+own and which one a library has depends on how it was linked. `tools/native-test/run.sh`
+checks that walk against a real linker's output and against `dlsym`'s answer for the same
+name.
+
+Two numbers now say which mechanism did what, and they are in different events on purpose:
+
+- `IO_REDIRECT_INSTALLED … slots=102 sqlite=8` — GOT slots, and SQLite's own table.
+- `GUEST_PATHS_PUBLISHED … slots=102 sqlite=8 data=…` — the same pair beside the gate that
+  reads them.
+
+`sqlite=0` with a database refusal is now a failure of the `paths` check rather than a
+note, and a build that does not report the field at all says so rather than being read as
+zero. The `+packed` marker on the per-library line names the format directly, so the next
+log states the premise instead of implying it.
+
+**No Google sign-in was attempted in this run**, and the `signin` check says exactly that
+rather than passing quietly.
+
+### Signing in: the refusal happens before the account picker, and that is measurable
+
+The thirteenth and sixteenth logs both contain sign-in attempts, and re-reading them for
+the *timing* rather than for the outcome answers a question this project has been treating
+as unanswerable.
+
+```
+ACTIVITY_IMPLICIT_LEFT_GUEST action=com.google.android.gms.auth.GOOGLE_SIGN_IN   …460.307
+D TokenPendingResult:  … Status{statusCode=CANCELED, resolution=null}            …460.686
+```
+
+Five attempts in the sixteenth run: 0.38 s, 0.47 s, 0.31 s, 0.23 s, 0.25 s. Four in the
+thirteenth, the same shape. **No account picker was ever drawn.** Nobody chose anything and
+nobody cancelled anything; Play services refused the request and returned.
+
+That is not the wall this project has been describing. The documented one — an OAuth client
+registered against a package and a signing certificate — is reached *after* an account is
+chosen and answers `DEVELOPER_ERROR`. What happens here is earlier and simpler:
+
+```java
+// play-services-auth, in the guest's own APK
+new SignInConfiguration(context.getPackageName(), googleSignInOptions)
+```
+
+`context.getPackageName()` is the guest's, correctly, because the graft works. The package
+that actually *started* the activity is `com.unique`, because a `:vappN` process is UNIQUE.
+Play services compares the two, and a caller claiming to be a package it is not is exactly
+what that comparison is for.
+
+So the request is now made self-consistent on the way out. `GoogleSignInHandoff` copies the
+configuration — the app keeps its own object untouched — replaces the field whose value is
+the guest's package name with `com.unique`, and reports what it did:
+
+```
+GOOGLE_SIGN_IN_RETARGETED action=…GOOGLE_SIGN_IN package=com.axlebolt.standoff2
+    to=com.unique fields=1 shape=bundle serverToken=requested
+```
+
+The field is found by value and never by name — `SignInConfiguration`'s fields are `zba`
+and `zbb` in one release of the client library and something else in the next — which is
+ARCHITECTURE §18 rule 8 applied to a data structure instead of a method.
+
+**What this is expected to buy, and what it is not.** It should get the account picker
+drawn, which is the state the user reports other engines reaching. It does not register an
+OAuth client: a sign-in asking only for id, email and profile needs none and should
+complete, while `requestIdToken(serverClientId)` and `requestServerAuthCode(...)` are
+validated against the client registered for the *calling* package and certificate — now
+`com.unique`, which no developer has registered — and the documented answer for that is
+`DEVELOPER_ERROR` (10). Which of the two a given app is in is a property of its own
+`GoogleSignInOptions`, so `serverToken=requested|no` is reported *before* Google answers,
+and the next log explains itself rather than starting another investigation.
+
+Stripping the token request to force a "success" was considered and deliberately not done.
+An app handed an account without the token it asked for fails later, on its own server, in
+a way nobody holding the phone can read.
+
+The analyzer has a `signin` check now, separate from `google`, and it reads the gap between
+the handoff and the answer. Under two seconds is a refusal before anything was drawn;
+longer is a person who saw the picker, which is a different event and must not be reported
+as this one. Runs 13 and 16 now fail it, which is the point: the tool reports a fault a
+real phone produced four runs ago and nobody read.
+
 ### What the thirteenth run settled about signing in, found late
 
 Re-read for a different question, the thirteenth log answers one this project had been
@@ -1710,9 +1838,32 @@ caught `restrictions`, `locale` and `connectivity` before one did.
 
 ## Next steps, in order
 
-1. **The fifteenth phone run.** This pass hooks every library in every guest's process and
-   changed the identity a guest reports for itself; neither can be observed anywhere but on
-   a phone. In order of what would matter most if it were wrong:
+1. **The eighteenth phone run.** Two changes, in two subsystems, and the log separates
+   them. In order of what would matter most if it were wrong:
+   - **Google sign-in.** Tap the Google button in Standoff 2 and watch for
+     `GOOGLE_SIGN_IN_RETARGETED … to=com.unique serverToken=…`, then whether an account
+     picker appears at all. The `signin` check reads the gap between the handoff and the
+     answer: under two seconds is the identity refusal again, longer means the picker was
+     drawn and whatever came back is a *different* answer. If Google says
+     `DEVELOPER_ERROR` after an account is chosen, that is the OAuth-client wall and the
+     first time this project has actually reached it.
+   - **A guest's own data still being there.** `sqlite=8` replaces SQLite's file
+     operations for every database in the process, and a redirect gone wrong shows as an
+     app that looks empty rather than one that crashes. **Open two or three apps with
+     state before the game** — the file manager, something signed in — and say whether
+     their data survived.
+   - `GUEST_PATHS_PUBLISHED … code=true sqlite=8 data=true`, and the `paths` check green.
+     `data=false` with `sqlite=0` means the VFS interface was not reached and the log says
+     which of the four reasons; `data=false` with `sqlite=8` means the fault is downstream
+     of the redirect and is new.
+   - `io_redirect: hooked libsqlite.so=2+abs+packed` — the `+packed` confirms the
+     seventeenth run's diagnosis directly. Its absence retracts it.
+   - Then the game: whether `Anticheat/VirtualSpaceWarning` still appears, and — only
+     after a login that completes — whether `AuthRestrictions/VirtualSpaceMessage` does.
+     The notice comes *after* the login, so a run without one proves nothing.
+2. **The fifteenth phone run's open items.** This pass hooks every library in every guest's
+   process and changed the identity a guest reports for itself; neither can be observed
+   anywhere but on a phone. In order of what would matter most if it were wrong:
    - **Every app that ran before still running, and still holding its own data.** A guest
      that cannot find its saved games is what a redirect gone wrong looks like; it does not
      announce itself. Open something with state — a launcher, a browser with a session, an
@@ -1728,7 +1879,7 @@ caught `restrictions`, `locale` and `connectivity` before one did.
    - The game: whether `Anticheat/VirtualSpaceWarning` still appears. That is the flag this
      pass is aimed at. `AuthRestrictions/VirtualSpaceMessage` on sign-in is a *different*
      ceiling and is not expected to move — see `docs/GOOGLE_SIGN_IN.md`.
-2. **The seventh phone run's open items**, which the verification emulator still cannot
+3. **The seventh phone run's open items**, which the verification emulator still cannot
    answer: it has no Play services, no IME, no `Android/obb` to import from and no
    code-virtualization protector to break. What to watch for, in the order the sixth run
    failed:
@@ -1750,10 +1901,10 @@ caught `restrictions`, `locale` and `connectivity` before one did.
    steps, send the capture. `tools/device-log/analyze.py` reads it with no toolchain at
    all, and the two checks added for the sixth run mean an asset or protector fault names
    itself now instead of looking like the app's own bug.
-3. ARM64 native code, a real GPU driver, a hardware Vulkan ICD, WebView rendering and a
+4. ARM64 native code, a real GPU driver, a hardware Vulkan ICD, WebView rendering and a
    real engine app — five things only a phone can answer, and every one of them is
    `NOT_TESTED` until it does.
-4. A temporary URI grant handed *into* a guest — the case a photo picker actually uses.
+5. A temporary URI grant handed *into* a guest — the case a photo picker actually uses.
    Sharing outward works (`t34`) and the inbound request is at least well-formed (`t36`),
    but arranging a real grant needs a third APK: instrumentation runs under the target
    app's uid and can neither write another app's files nor grant for its authority.

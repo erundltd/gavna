@@ -13,6 +13,12 @@ done
 # See reloc_shape.c: this is the construct that made SQLite's `stat` invisible to a GOT
 # hook, and the check is that it still produces an absolute data relocation with a zero
 # addend — the case `plt_hook.cpp::is_address_slot` was taught to accept.
+# The symbol walk `sqlite_vfs.cpp` reaches SQLite's own VFS interface through, checked
+# against a real linker's output and against dlsym's answer for the same name.
+${CC:-gcc} -O1 -fPIC -shared -o "$out/elf_probe.so" "$here/elf_probe.c"
+${CXX:-g++} -std=c++20 -O1 -Wall -Wextra -o "$out/elf_symbols_test" "$here/elf_symbols_test.cpp" -ldl
+"$out/elf_symbols_test" "$out/elf_probe.so"
+
 ${CC:-gcc} -O1 -fPIC -shared -o "$out/reloc_shape.so" "$here/reloc_shape.c"
 relocs="$(readelf -r "$out/reloc_shape.so")"
 fail=0

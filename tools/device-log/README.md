@@ -53,6 +53,7 @@ blame.
 | `permissions` | Was a permission denied that no user could ever have granted — including one the *host* is blocked from holding? |
 | `storage` | Could a guest read its own external storage, and did its expansion files reach the instance? |
 | `google` | Was a guest told the phone has no Play services when it has, and did its requests reach Google under a name Google accepts? |
+| `signin` | Did a Google sign-in get as far as an account picker, or was it refused before one could be drawn? |
 | `native` | Did a native crash follow a library the path redirector patched? |
 | `detection` | Could a guest read UNIQUE out of its own `/proc/self/maps`? |
 | `hooks` | Did every shim bind to a real method, or did one bind to nothing? |
@@ -151,6 +152,30 @@ services**, and **a guest was told it does not**. Hiding it from an instance tha
 `Unknown calling package name` is not a failure — that instance earned it. Hiding it from
 one that has proved nothing is, and so is the app's own
 `requires Google Play services, but they are missing` on a phone that has them.
+
+### The one the seventeenth run added: `signin`
+
+Separate from `google`, and the separation is the finding. `google` asks whether a guest
+can *reach* Play services at all. This one asks what happens to the request it makes when
+it does, and it reads a clock:
+
+```
+ACTIVITY_IMPLICIT_LEFT_GUEST action=com.google.android.gms.auth.GOOGLE_SIGN_IN   …460.307
+D TokenPendingResult:  … Status{statusCode=CANCELED, resolution=null}            …460.686
+```
+
+Nine attempts across the thirteenth and sixteenth runs, every one answered in under half a
+second. **No account picker was ever drawn**, which is what makes this a refusal rather
+than a person changing their mind — and telling those two apart is the whole reason the
+check measures the gap instead of matching the status code. Under two seconds is the
+identity refusal; longer means somebody saw a list of accounts and whatever came back is a
+different answer, reported as a note rather than a failure.
+
+`GOOGLE_SIGN_IN_RETARGETED` is UNIQUE making the request self-consistent before it leaves;
+a handoff with no such line is a build without the fix, or one that could not find the
+configuration, and `GOOGLE_SIGN_IN_NOT_RETARGETED` says which. `serverToken=requested`
+means the app asked for an ID token or a server auth code, so a `DEVELOPER_ERROR` further
+down the log is the expected next wall rather than a new fault.
 
 ### The one worth explaining: `platform`
 

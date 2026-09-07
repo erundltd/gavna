@@ -60,15 +60,15 @@ exist because a claim was made without evidence and a later phone log contradict
 - `/proc/self/maps` inside a guest no longer names UNIQUE — `PROC_VIEW_INSTALLED …
   named=16 leaked=0` on the phone, and the graft checks its own work.
 - Two instances of one app have separate identities, storage and `ANDROID_ID`.
-- 290 JVM tests, 94 host-side native checks, 105 device-log tests, 17 APK-survey tests, 15
+- 300 JVM tests, 104 host-side native checks, 118 device-log tests, 17 APK-survey tests, 15
   Dart tests. All passing.
 
 ### Does not work
 
 | | Where it stands |
 |---|---|
-| **The "virtual space" notice in Standoff 2** | Not yet closed, and **never yet tested with the fix intact** — see §4. |
-| **Google sign-in** | Fails as "Попытка входа отменена". `docs/GOOGLE_SIGN_IN.md`. |
+| **The "virtual space" notice in Standoff 2** | The code half of the path fix is **live on hardware** as of run 17 (`code=true`); the data half is not, and the notice has not been seen either way since. See §4. |
+| **Google sign-in** | Fails as "Попытка входа отменена". Run 17 changed what is known about *why*: the refusal is timed at under half a second with no account picker drawn, which is not the OAuth-client wall this project had been describing. A fix is in this build and **has not been run on a phone**. §5 and `docs/GOOGLE_SIGN_IN.md` §0. |
 | **Sign-in through a browser** (Facebook, VK, most OAuth) | The identity half already works; the *return* leg does not. This is the highest-value unbuilt piece. §5. |
 | **Attestation** (Play Integrity, vendor device checks) | Out of reach and stated as such. UNIQUE is not an attestation bypass. |
 | A packed app (`bin.mt.plus`) | Its protector declines to register natives. Unsolved. |
@@ -89,10 +89,10 @@ The NDK is installed by Gradle on first native build. AGP 8.13.0, Kotlin 2.2.20.
 ### Commands
 
 ```bash
-./gradlew test                    # 290 JVM tests
-./tools/native-test/run.sh        # 94 host-side native checks, no device
+./gradlew test                    # 300 JVM tests
+./tools/native-test/run.sh        # 104 host-side native checks, no device
 (cd ui && flutter test)           # 15 Dart tests
-./tools/device-log/self_test.py   # 105 tests for the log analyzer, no toolchain
+./tools/device-log/self_test.py   # 118 tests for the log analyzer, no toolchain
 ./tools/apk-survey/self_test.py   # 17 tests
 ./tools/check-translations.py     # every engine failure has both languages
 ./tools/report-unimplemented.sh   # every deliberately unimplemented surface
@@ -201,11 +201,16 @@ Neither half is applied until it is measured:
 
 `GUEST_PATHS_PUBLISHED package=… code=… data=… slots=… apk=… detail=…` reports both.
 
-**Current state: `code=false`, `data=false`.** As of the sixteenth run the cause was found
-(§6, "`java.io.File` is two libraries") and the fix — `libopenjdk.so` in scope, plus the
-large-file symbol spellings — is in the build that has not yet been tested. **No phone has
-ever run a build in which the code paths were actually published and correct.** Everything
-downstream of that is therefore unmeasured.
+**Current state: `code=true`, `data=false`** — measured on the phone, run 17. The
+sixteenth run's fix (§6, "`java.io.File` is two libraries") held: `libopenjdk.so` in scope
+plus the large-file symbol spellings produced the first log in which a guest was handed an
+installed-shaped APK path that actually opened.
+
+The data half refused with the fourteenth run's SQLite message, in a build that was meant
+to have closed it — see §6, "SQLite was never redirected at all". That fix is in this
+build and has not been run on a phone. **The virtual-space notice has still never been
+observed with both halves intact**, and it only appears after a login, so a run without one
+proves nothing.
 
 ---
 
@@ -218,10 +223,34 @@ app's identity*.
 
 | The SDK asks | Example | UNIQUE |
 |---|---|---|
-| Play services — another process, resolving the caller by kernel uid | Google Sign-In | cannot reach that conversation |
+| Play services — another process, resolving the caller by kernel uid | Google Sign-In | two walls, and the first one is fixed in this build — see below |
 | the app's own `PackageManager` | Facebook, VK, most SDKs | **already answers correctly** |
 
-The second row is **proven on the phone**, in the thirteenth run. The Facebook SDK printed
+### The Google refusal was never the one this project was describing
+
+Re-read the thirteenth and sixteenth logs for *timing* and they say something the outcome
+alone cannot:
+
+```
+ACTIVITY_IMPLICIT_LEFT_GUEST action=…auth.GOOGLE_SIGN_IN   …460.307
+D TokenPendingResult: … Status{statusCode=CANCELED}        …460.686
+```
+
+Five attempts in run 16 at 0.23–0.47 s, four more in run 13. **No account picker was ever
+drawn**, and `DEVELOPER_ERROR` appears in neither log — nothing got far enough to ask for a
+token. The refusal is earlier: the client library builds
+`new SignInConfiguration(context.getPackageName(), options)`, which inside UNIQUE names the
+guest, while the package that *started* the activity is `com.unique`. Play services compares
+them and refuses.
+
+`GoogleSignInHandoff` now copies the configuration and replaces that field with
+`com.unique`, reporting `GOOGLE_SIGN_IN_RETARGETED … serverToken=requested|no`. It is
+expected to get the picker drawn and then to meet the OAuth-client wall for an app that
+asks for an ID token. **No phone has run it.** The `signin` check in the analyzer is what
+settles it, and it reads the gap: under two seconds is this refusal again, longer is a
+person looking at a list of accounts.
+
+The `PackageManager` row is **proven on the phone**, in the thirteenth run. The Facebook SDK printed
 the key hash it computed from `getPackageInfo(getPackageName(), GET_SIGNATURES)`:
 
 ```
@@ -254,6 +283,11 @@ virtual-space verdict. Closing the verdict first is what makes the browser work 
 - ~~"Google sign-in from a virtual space cannot work, ever."~~ That describes the route
   UNIQUE takes. It is not a proof that no route exists. How another engine gets one through
   is the most valuable unknown in that document.
+- ~~"Google sign-in fails because the OAuth client is registered against the app's package
+  and certificate."~~ True of a wall this project has never reached. Runs 13 and 16 were
+  refused in under half a second with no picker drawn, which is a *different* refusal, and
+  reasoning from the documented one is what kept it hidden for four runs. Read the timing,
+  not just the status code.
 - ~~"The game never calls Play Integrity."~~ Measured over three runs of 59–93 seconds
   that all end at a failed login. What is supported is only: *the game does not gate the
   sign-in attempt on Play Integrity* (ChatGPT, in the same log, binds it six times at the
@@ -291,6 +325,7 @@ This is where most of the recent work happened and where the next bug will proba
 | + `libjavacore.so`, `libsqlite.so`, `libandroid_runtime.so` | 14 | a system library outside it could not `statfs` the published APK path — the game told its player the device was out of space |
 | **everything** (`scope=*`, 436 slots in 385 libraries) | 15 | the Mali driver could not find its gralloc mapper and **aborted the render thread**: `mali_config_interface_mapper: Failed to acquire IMapper service. Aborting.` + `SIGABRT` |
 | named list derived from run 15's own per-library output | 16 | the code gate still refused — see below |
+| + `libopenjdk.so` and the large-file symbol spellings | 17 | **`code=true`.** The scope is right now; what was left was not a scope problem at all |
 
 **The lesson from run 15, which is the important one**: the safety argument ("no rule can
 match `/data/user/0/com.unique`, so a hooked library touching UNIQUE's files is unaffected")
@@ -302,9 +337,8 @@ whatever the table then decides. A driver is exactly such a library. `/vendor/`,
 
 - **SQLite stores libc addresses in data, not calls.** `{"open", (void*)posixOpen}` is a
   local wrapper and reaches the PLT; `{"stat", (void*)stat}` is the address and does not. A
-  GOT hook redirects half of one library. Absolute (`R_AARCH64_ABS64`, zero addend) data
-  relocations are patched — **in `libsqlite.so` only**, because patching them everywhere is
-  what run 15 did.
+  GOT hook redirects half of one library. See below: the relocation patch written for this
+  never ran, and SQLite is redirected through its own VFS interface instead.
 - **`java.io.File` is two libraries.** Writes go through libcore's `Os` API in
   `libjavacore.so`. `isFile()`, `length()`, `lastModified()`, `delete()`, `list()` are
   `UnixFileSystem`'s *native* methods, and those live in **`libopenjdk.so`**, written
@@ -312,6 +346,32 @@ whatever the table then decides. A driver is exactly such a library. `/vendor/`,
   though it is the same function on a 64-bit device. Every write was redirected and the
   first `stat` of a published path was not. Fixed in the build after run 16;
   **unverified on a phone.**
+
+### SQLite was never redirected at all, and the log said so in four characters
+
+The fix written after run 14 was to patch `R_AARCH64_ABS64` relocations in `libsqlite.so`.
+Run 17 shows it reaching nothing:
+
+```
+io_redirect: hooked libsqlite.so=2+abs
+```
+
+Two is the PLT count on its own, and `+abs` says absolute patching was *enabled* for this
+library — not that a single absolute slot was found. None were, because **Android links its
+platform libraries with `--pack-dyn-relocs`**: `.rela.dyn` becomes an APS2 blob under
+`DT_ANDROID_RELA`, and `read_dynamic` reads `DT_RELA`. Such a library reports as having no
+data relocations at all, which is exactly what a library with none reports.
+
+SQLite is now redirected through the interface it publishes for the purpose —
+`sqlite3_vfs.xSetSystemCall`, version 3 — which replaces an entry of `aSyscall` by name,
+covers every use of it, and is indifferent to the link format.
+`core/native/…/elf_symbols.h` finds `sqlite3_vfs_find` inside a platform library that an
+app's linker namespace refuses to `dlopen`, by walking the loaded library's own `.dynsym`;
+`tools/native-test/elf_symbols_test.cpp` checks that walk against `dlsym`'s answer.
+
+Read `sqlite=<n>` on `IO_REDIRECT_INSTALLED` and on `GUEST_PATHS_PUBLISHED`. Zero with a
+database refusal is now a `paths` failure rather than a note, and `+packed` on the
+per-library line confirms or retracts the premise above directly.
 
 ### If a published path still does not resolve
 
@@ -343,12 +403,12 @@ computer.
 python3 tools/device-log/analyze.py <recorded.log> --device <device.txt>
 ```
 
-19 checks (`analyze.CHECKS`); exit status 0 when all pass. `tools/device-log/README.md` explains each. Every
+20 checks (`analyze.CHECKS`); exit status 0 when all pass. `tools/device-log/README.md` explains each. Every
 phone run is checked in as a fixture under `tools/device-log/fixtures/` with assertions in
 `self_test.py`, so **a check that stops reporting a fault a real phone produced is a
 regression in the tool** rather than progress in the engine.
 
-Fourteen captures are checked in — the first run, then runs 4 through 16; runs 2 and 3
+Fifteen captures are checked in — the first run, then runs 4 through 17; runs 2 and 3
 predate the analyzer and were never kept. When a new log arrives:
 
 1. run the analyzer;
@@ -363,25 +423,30 @@ predate the analyzer and were never kept. When a new log arrives:
 
 ## 8. What to do next, in order
 
-1. **The seventeenth run.** The build after run 16 has `libopenjdk.so` in scope and the
-   large-file spellings in the table. What it has to show:
-   - `GUEST_PATHS_PUBLISHED … code=true` and the `paths` check green. If it refuses again,
-     the message now names which of the three faults it is.
-   - Apps that had data still having it — a redirect gone wrong shows as an app that looks
-     empty, not one that crashes. **Ask the tester to open two or three before the game.**
+1. **The eighteenth run.** Two changes, in two subsystems, and the log separates them.
+   - **Google sign-in.** Tap the Google button in Standoff 2. Watch for
+     `GOOGLE_SIGN_IN_RETARGETED … to=com.unique serverToken=…` and then for whether an
+     account picker appears at all. The `signin` check times the answer: under two seconds
+     is the identity refusal again; longer means the picker was drawn and whatever came
+     back is a different answer. `DEVELOPER_ERROR` after an account is chosen would be the
+     OAuth-client wall, reached for the first time.
+   - **`data=true`.** `sqlite=<n>` on `GUEST_PATHS_PUBLISHED` says whether SQLite's own
+     syscall table was replaced. Zero means the VFS interface was not reached; a non-zero
+     count with `data=false` is a new fault, downstream of the redirect.
+   - **Apps that had data still having it** — a redirect gone wrong shows as an app that
+     looks empty, not one that crashes. **Ask the tester to open two or three before the
+     game.**
    - Whether the virtual-space notice appears, **and whether it lets play continue**: the
-     client warning and the server verdict are different messages and only the second ends
-     the session.
-2. **`data=true`.** The SQLite half needs the `libsqlite.so` absolute-relocation patch to
-   have worked. Same log will say.
-3. **The in-space OAuth browser** (§5). The largest unbuilt piece and the one that makes a
+     client warning and the server verdict are different messages, only the second ends the
+     session, and neither appears before a login.
+2. **The in-space OAuth browser** (§5). The largest unbuilt piece and the one that makes a
    Facebook or VK login able to complete.
-4. **The last Google route.** `GMS_PACKAGE_NOT_REWRITTEN descriptor=android.os.IMessenger
+3. **The last Google route.** `GMS_PACKAGE_NOT_REWRITTEN descriptor=android.os.IMessenger
    code=1 bareAt=144 size=308` — Firebase Analytics sends the guest's package as a bare
    string inside a Bundle, not as a SafeParcel field. Deliberately not rewritten: changing a
    bare string's length would need the enclosing container's header fixed up, and a corrupt
    request to Play services is worse than a refused one.
-5. `bin.mt.plus` and its protector. Unsolved since run 11.
+4. `bin.mt.plus` and its protector. Unsolved since run 11.
 
 ---
 
@@ -400,7 +465,8 @@ middle for readability and `…` stands for `src/main/kotlin/com/unique`.
 | `core/common/…/common/path/VirtualPathModel.kt` | The path contract, both tables |
 | `core/common/…/common/nativelib/GuestNativeExclusions.kt` | Libraries never hooked, each with its run |
 | `core/native/src/main/cpp/` | `plt_hook`, `io_redirect`, `proc_view`, `redirect_table`, crash handler, property virtualization |
-| `core/google/` | Routing table, `GmsBrokerBinder` calling-package rewrite |
+| `core/google/` | Routing table, `GmsBrokerBinder` calling-package rewrite, `GoogleSignInHandoff` |
+| `core/native/src/main/cpp/sqlite_vfs.cpp`, `elf_symbols.h` | SQLite through its own VFS interface, and the symbol walk that reaches it |
 | `core/vpm/`, `core/vprocess/`, `core/vstorage/`, `core/vpermission/`, `core/vprofile/` | Virtual PackageManager, process pool, storage, permissions, per-instance device identity |
 | `tools/device-log/` | The log analyzer, its tests and every phone fixture |
 | `tools/native-test/` | Host-side C++ checks — no device, no NDK |

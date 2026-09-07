@@ -1022,6 +1022,12 @@ object AppBootstrap {
                     // path and is invisible unless it is counted.
                     "procView" to armed.view.toString(),
                     "slots" to UniqueNative.redirectSlotsPatched().toString(),
+                    // SQLite is counted separately because it is redirected by a
+                    // different mechanism: it stores libc addresses in a table rather
+                    // than calling them, so no number of patched GOT slots says anything
+                    // about whether a guest's databases land in the instance. Zero here
+                    // with a healthy `slots` is exactly the fourteenth run's fault.
+                    "sqlite" to UniqueNative.sqliteCallsReplaced().toString(),
                     "scope" to armed.scope.joinToString(",").take(200),
                     // Reported on every launch, not only when it is non-empty: a library
                     // that is deliberately not hooked and one the scan never found produce

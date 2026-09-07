@@ -249,6 +249,13 @@ internal object GuestIdentityPaths {
                 // How much interception was actually in when this decided. A published
                 // path with no redirect behind it is the failure mode this gates.
                 "slots" to slots.toString(),
+                // And how much of SQLite. The data half fails on its own when a database
+                // opened through the public path does not land in the instance, and this
+                // is the one number that says why: SQLite's syscall table is replaced
+                // through its own VFS interface, not by patching relocations, and zero
+                // means that did not happen. See `UniqueNative.sqliteCallsReplaced`.
+                "sqlite" to runCatching { UniqueNative.sqliteCallsReplaced() }
+                    .getOrDefault(0).toString(),
                 "data" to data.toString(),
                 "apk" to publicApkDir,
                 "detail" to result.detail,

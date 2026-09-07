@@ -1241,6 +1241,40 @@ frozen after `attachBaseContext` so the hot path is a sorted-array scan (typical
 entries, one `strncmp` each). Redirection is per-process and carries the process's vuid, so
 `:vapp3` can never see `:vapp4`'s tree.
 
+### 7.3.0 The library that does not call libc, and the one that cannot be walked
+
+Two libraries in every guest's process defeat a GOT hook, for two different reasons, and
+both were diagnosed by a phone log rather than by reading.
+
+**SQLite does not call libc; it stores its addresses.** `os_unix.c` builds a static table —
+`{ "stat", (sqlite3_syscall_ptr)stat, 0 }` — that the linker fills in at load, and every
+later use reads it from there without touching the GOT. A hook that patches calls redirects
+`open`, because that one goes through a local wrapper, and nothing else. The fourteenth run
+is that half: the probe database was created inside the instance and then looked for at the
+path the guest had been handed, `file renamed while open`, `SQLITE_IOERR_FSTAT`.
+
+**And the relocation that would have fixed it cannot be walked.** The answer written for the
+fourteenth run was to patch `R_AARCH64_ABS64` slots in `libsqlite.so`. The seventeenth run
+shows it reaching nothing: `io_redirect: hooked libsqlite.so=2+abs`, where two is the PLT
+count on its own and `+abs` names an attempt. Android links its platform libraries with
+`--pack-dyn-relocs`, so `.rela.dyn` is an APS2 blob under `DT_ANDROID_RELA` rather than an
+array of `ElfW(Rela)`, and a scan that reads `DT_RELA` sees a library with no data
+relocations at all — indistinguishable, in every number it reports, from one that has none.
+
+So SQLite is redirected through its own front door instead. `sqlite3_vfs` version 3 carries
+`xSetSystemCall`, which replaces an entry of that table by name, reaches every use of it,
+and does not care how the library was linked. Getting to it needs the address of
+`sqlite3_vfs_find` inside a platform library an app's linker namespace will not `dlopen`;
+`core/native/…/elf_symbols.h` reads it out of the loaded library's own `.dynsym`, bounding
+the walk with whichever hash table the library carries.
+
+Every failure — the library not mapped yet, no such symbol, a VFS older than version 3, a
+name this build's table does not have — leaves SQLite exactly as it was and is counted.
+`sqlite=<n>` rides on `IO_REDIRECT_INSTALLED` and on `GUEST_PATHS_PUBLISHED`, because
+"the redirect is healthy" and "a guest's databases land in the instance" are different
+facts and a slot count only answers the first. The `+packed` marker on the per-library line
+states the premise so a later run can retract it.
+
 ### 7.3.1 The inverse table: what `/proc` says about all of it
 
 Redirection covers the paths a guest **hands out**. It does nothing about the ones a guest
@@ -1569,6 +1603,45 @@ bind that works, and a PAIRIP-protected app calls `System.exit(0)` when it canno
 
 This is a floor, not a ceiling. It converts a fatal crash into a degraded but working app,
 and the bridges below are what would convert it into a working Google flow.
+
+### 9.1.2 The sign-in handoff, and the refusal that happens before any of this
+
+§9.1's table is about what Play services *answers*. There is an earlier refusal that no
+row of it describes, and it is the one every phone run has actually hit.
+
+`GoogleSignInClient.getSignInIntent()` returns an intent to the app's **own**
+`SignInHubActivity` — a class out of the `play-services-auth` the app bundles, so it runs
+inside the space like any other guest activity. That activity then starts
+`com.google.android.gms.auth.GOOGLE_SIGN_IN`, which leaves the space, carrying:
+
+```java
+new SignInConfiguration(context.getPackageName(), googleSignInOptions)
+```
+
+Inside UNIQUE the first argument is the guest's package, because the graft works. The
+package that started the activity is `com.unique`, because a `:vappN` process is UNIQUE.
+Play services compares them and refuses the mismatch — in the sixteenth run five times, in
+0.23 s to 0.47 s, with no account picker ever drawn:
+
+```
+ACTIVITY_IMPLICIT_LEFT_GUEST action=…auth.GOOGLE_SIGN_IN   …460.307
+D TokenPendingResult: … Status{statusCode=CANCELED}        …460.686
+```
+
+`GoogleSignInHandoff` makes the two agree. On the way out, the configuration is **copied**
+— a parcel round trip through its own `CREATOR`, so the object `SignInHubActivity` is still
+holding is untouched — the field whose value equals the guest's package name is replaced
+with `com.unique`, and the substitution is reported with whether the request also asks for
+a server token. The field is found by value, never by name: `SignInConfiguration`'s fields
+are obfuscated and are renamed between releases of the client library, while the value is
+what it is. That is §18 rule 8 applied to a data structure rather than to a method.
+
+This reaches §9.1's wall; it does not remove it. A sign-in asking only for id, email and
+profile needs no OAuth client and should complete. One asking for an ID token or a server
+auth code is validated against the client registered for the calling package and
+certificate, which is now `com.unique`, and the documented answer is `DEVELOPER_ERROR`.
+Reporting `serverToken=requested` before Google answers is what makes the next log explain
+itself. `docs/GOOGLE_SIGN_IN.md` §0 is the long version.
 
 ### 9.2 Router
 

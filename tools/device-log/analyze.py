@@ -480,6 +480,34 @@ def check_guest_paths(run: Run) -> Check:
                 f"{event['package']}: code paths published, data paths held back — "
                 f"{event['detail']}"
             )
+            # Which of the two mechanisms was missing when the refusal was SQLite's.
+            #
+            # SQLite stores libc addresses in a table rather than calling them, so no
+            # number of patched GOT slots says anything about it; the count that does is
+            # how many of its syscalls were replaced through its own VFS interface. A
+            # build that does not report the field at all is an older one and says so,
+            # rather than being read as zero.
+            if "sqlite" in (event["detail"] or "").lower() or "SQLITE" in (event["detail"] or ""):
+                replaced = event["sqlite"]
+                if replaced is None:
+                    check.note(
+                        f"{event['package']}: the database probe is what refused, and this "
+                        f"build does not report how much of SQLite was redirected"
+                    )
+                elif replaced == "0":
+                    check.fail(
+                        f"{event['package']}: the database probe refused and none of "
+                        f"SQLite's own system calls were replaced — every database the "
+                        f"guest opens reaches the real filesystem",
+                        event.lineno,
+                        event["detail"] or "",
+                    )
+                else:
+                    check.note(
+                        f"{event['package']}: {replaced} of SQLite's system calls were "
+                        f"replaced and the database probe still refused — the fault is "
+                        f"downstream of the redirect"
+                    )
         else:
             check.fail(
                 f"{event['package']}: no installed-shaped paths were published at all — "
@@ -1212,6 +1240,118 @@ def check_google_stack(run: Run) -> Check:
             )
     return check
 
+_SIGN_IN_ACTIONS = {
+    "com.google.android.gms.auth.GOOGLE_SIGN_IN",
+    "com.google.android.gms.auth.APPAUTH_SIGN_IN",
+}
+
+# What the client library prints when Play services hands back a result. `CANCELED` and
+# `12501` are the same answer spelled two ways, and both mean the sign-in was refused
+# rather than abandoned by the user — which is the distinction this check exists to make.
+_SIGN_IN_REFUSED = re.compile(r"statusCode=(?:CANCELED|SIGN_IN_CANCELLED|12501)\b")
+
+# Long enough that a person could have seen a list of accounts and chosen one. Anything
+# faster than this came back before a window was drawn.
+_PICKER_SECONDS = 2.0
+
+
+def check_sign_in(run: Run) -> Check:
+    """Did a Google sign-in get as far as an account picker?
+
+    Distinct from the `google` check, which is about a guest being able to *reach* Play
+    services at all. This one is about the request it makes when it gets there, and it
+    exists because the failure it reports was mistaken for the other one for four runs.
+
+    The thirteenth and sixteenth runs both contain it, and the timing is the whole
+    finding:
+
+    ```
+    ACTIVITY_IMPLICIT_LEFT_GUEST action=…auth.GOOGLE_SIGN_IN   1788767460.307
+    D TokenPendingResult: … Status{statusCode=CANCELED}        1788767460.686
+    ```
+
+    Three hundred and seventy-nine milliseconds, five times in a row, and no account
+    picker was ever drawn. Play services compares the package inside the request's
+    `SignInConfiguration` — the guest's, because the graft is working — against the
+    package that started the activity, which is `com.unique`, and refuses the mismatch.
+    `GOOGLE_SIGN_IN_RETARGETED` is UNIQUE making the two agree; a handoff without one is a
+    build that does not carry the fix, or one that could not find the configuration.
+    """
+    check = Check("signin", "Did a Google sign-in get as far as an account picker?")
+
+    handoffs = [
+        e for e in run.by_code("ACTIVITY_IMPLICIT_LEFT_GUEST")
+        if e["action"] in _SIGN_IN_ACTIONS
+    ]
+    retargeted = run.by_code("GOOGLE_SIGN_IN_RETARGETED")
+    declined = run.by_code("GOOGLE_SIGN_IN_NOT_RETARGETED")
+    if not handoffs and not retargeted and not declined:
+        check.note("no Google sign-in was attempted in this run")
+        return check
+
+    at = {line.lineno: line for line in run.lines}
+    refusals = [line for line in run.lines if _SIGN_IN_REFUSED.search(line.message)]
+
+    def refusal_after(lineno: int) -> Tuple[Optional[LogLine], Optional[float]]:
+        for line in refusals:
+            if line.lineno <= lineno:
+                continue
+            start = at.get(lineno)
+            gap = None
+            if start is not None:
+                began = uniquelog.seconds_of(start.raw)
+                ended = uniquelog.seconds_of(line.raw)
+                if began is not None and ended is not None:
+                    gap = ended - began
+            return line, gap
+        return None, None
+
+    for event in retargeted:
+        check.note(
+            f"{event['package']}: the sign-in request was retargeted to {event['to']} "
+            f"({event['fields']} field(s), server token {event['serverToken']})"
+        )
+    for event in declined:
+        check.fail(
+            f"{event['package']}: a Google sign-in was not retargeted — {event['reason']}. "
+            f"Play services refuses a request whose configuration names a package other "
+            f"than the one that started the activity",
+            event.lineno,
+        )
+
+    for event in handoffs:
+        line, gap = refusal_after(event.lineno)
+        package = event["package"] or "a guest"
+        if line is None:
+            check.note(f"{package}: a sign-in reached Play services and this log does not "
+                       f"say what came back")
+            continue
+        timing = f" after {gap:.2f}s" if gap is not None else ""
+        drawn = gap is not None and gap >= _PICKER_SECONDS
+        if not retargeted:
+            check.fail(
+                f"{package}: Play services refused the sign-in{timing}"
+                + ("" if drawn else ", which is before an account picker could be drawn")
+                + " — the request went out carrying the guest's own package name",
+                line.lineno,
+                line.message.strip()[:160],
+            )
+        elif not drawn:
+            check.fail(
+                f"{package}: the request was retargeted and Play services still refused "
+                f"it{timing}, before anything was drawn",
+                line.lineno,
+                line.message.strip()[:160],
+            )
+        else:
+            check.note(
+                f"{package}: the sign-in was refused{timing} — long enough that a person "
+                f"saw the picker, so this is a choice or a Google-side answer rather than "
+                f"the identity refusal"
+            )
+    return check
+
+
 _HOOKED_LIBRARY = re.compile(r"hooked \d+ new slot\(s\) after loading (\S+)")
 
 
@@ -1331,6 +1471,7 @@ CHECKS = (
     check_permissions,
     check_storage,
     check_google_stack,
+    check_sign_in,
     check_native_hooks,
     check_detection,
     check_guest_paths,

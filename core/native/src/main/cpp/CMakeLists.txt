@@ -17,6 +17,7 @@ add_library(unique_native SHARED
         unique_native.cpp
         io_redirect.cpp
         plt_hook.cpp
+        sqlite_vfs.cpp
         prop_virtual.cpp
         crash_handler.cpp
         vulkan_probe.cpp

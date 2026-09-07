@@ -130,6 +130,35 @@ def parse_log(text: str) -> List[LogLine]:
     return out
 
 
+# The clock at the front of a line, in whichever of the two framed layouts it arrived.
+#
+# Only two of the three layouts have one: `unique.log` carries the event's own timestamp
+# in the message instead. Both of these are wall-clock and both are used only for a
+# *difference* between two lines of the same file, which is what makes "refused in under a
+# second, before anything could be drawn" a measurement rather than an impression.
+_EPOCH_PREFIX = re.compile(r"^(\d{10}\.\d{1,6})\s")
+_LOGCAT_PREFIX = re.compile(r"^(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})\s")
+
+
+def seconds_of(raw: str) -> Optional[float]:
+    """Seconds from the line's own clock, or None when the layout carries none.
+
+    A recorder export puts an epoch time first; `adb logcat -v threadtime` puts a
+    month-day time. The month-day form is turned into seconds within the year, which is
+    monotonic inside one capture and is never compared across two.
+    """
+    if not raw:
+        return None
+    m = _EPOCH_PREFIX.match(raw)
+    if m:
+        return float(m.group(1))
+    m = _LOGCAT_PREFIX.match(raw)
+    if m:
+        month, day, hour, minute, second, millis = (int(g) for g in m.groups())
+        return (((month * 31 + day) * 24 + hour) * 60 + minute) * 60 + second + millis / 1000.0
+    return None
+
+
 def parse_fields(rest: str) -> Dict[str, str]:
     """Splits `k=v k2=v2` where a value may itself contain spaces."""
     starts = [(m.start(1), m.group(1), m.end()) for m in _FIELD_START.finditer(rest)]

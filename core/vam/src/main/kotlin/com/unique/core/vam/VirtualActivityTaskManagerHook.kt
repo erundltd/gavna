@@ -2,6 +2,9 @@ package com.unique.core.vam
 
 import android.content.Context
 import android.content.Intent
+import android.os.Bundle
+import android.os.Parcel
+import android.os.Parcelable
 import com.unique.core.common.apk.ComponentEntry
 import com.unique.core.common.apk.ComponentKind
 import com.unique.core.common.diag.DiagChannel
@@ -9,6 +12,7 @@ import com.unique.core.common.diag.DiagLevel
 import com.unique.core.common.shim.MethodShim
 import com.unique.core.common.shim.shim
 import com.unique.core.diagnostics.Diagnostics
+import com.unique.core.google.GoogleSignInHandoff
 import com.unique.core.hook.SystemServiceHook
 import java.lang.reflect.Method
 
@@ -115,7 +119,9 @@ object VirtualActivityTaskManagerHook {
         // anyone outside UNIQUE, and this is the last point at which it can be made usable.
         // See VirtualUriGrants.
         val granted = VirtualUriGrants.rewriteOutgoing(hostPackage, rawIntent, ready)
-        val intent = retargetSettingsIntent(hostPackage, granted, ready)
+        val intent = retargetGoogleSignInIntent(
+            hostPackage, retargetSettingsIntent(hostPackage, granted, ready), ready,
+        )
         val component = intent.component
         if (component == null) return routeImplicit(hostPackage, intent, ready)
         if (component.packageName != ready.params.packageName) return intent
@@ -138,6 +144,135 @@ object VirtualActivityTaskManagerHook {
             ),
         )
         return stubIntent
+    }
+
+    /**
+     * Makes the two halves of a Google sign-in request agree about who is asking.
+     *
+     * The thirteenth phone run timed this failure precisely: the guest's own
+     * `SignInHubActivity` starts `com.google.android.gms.auth.GOOGLE_SIGN_IN`, the intent
+     * leaves the space, and six hundred milliseconds later the app is told the attempt was
+     * cancelled — with no account picker ever drawn. Play services compares the package
+     * inside the request's `SignInConfiguration`, which is the guest's, against the package
+     * that started the activity, which is `com.unique` because a `:vappN` process is
+     * UNIQUE. They disagree, and disagreeing is exactly what that check refuses.
+     *
+     * So the configuration is rewritten to say `com.unique`, which is the truth about the
+     * caller and the same correction [com.unique.core.google.GmsBrokerBinder] already makes
+     * on every service bind. See `GoogleSignInHandoff` for what this does and does not buy
+     * — it gets the picker drawn; it does not register an OAuth client.
+     *
+     * The app's own object is never touched. A parcel round trip makes an independent copy
+     * first, so a configuration the guest is still holding — `SignInHubActivity` keeps the
+     * one it was started with — reads exactly as it did.
+     *
+     * Every failure returns the intent unchanged and says why, because the outcome of not
+     * rewriting is the refusal that was already happening.
+     */
+    private fun retargetGoogleSignInIntent(
+        hostPackage: String,
+        intent: Intent,
+        ready: AppBootstrap.Result.Ready,
+    ): Intent {
+        val action = intent.action ?: return intent
+        if (!GoogleSignInHandoff.isHandoff(action)) return intent
+        val guest = ready.params.packageName
+        if (guest == hostPackage) return intent
+
+        val located = locateSignInConfig(intent)
+        if (located == null) {
+            notRetargeted(action, guest, "the request carries no configuration object")
+            return intent
+        }
+        val copy = copyParcelable(located.config)
+        if (copy == null) {
+            notRetargeted(action, guest, "the configuration could not be copied")
+            return intent
+        }
+        val fields = GoogleSignInHandoff.rewriteConsumer(copy, guest, hostPackage)
+        if (fields == 0) {
+            notRetargeted(action, guest, "no field of the configuration names this guest")
+            return intent
+        }
+
+        val out = Intent(intent)
+        if (located.bundle != null) {
+            val holder = Bundle(located.bundle)
+            holder.putParcelable(GoogleSignInHandoff.CONFIG_KEY, copy)
+            out.putExtra(GoogleSignInHandoff.CONFIG_KEY, holder)
+        } else {
+            out.putExtra(GoogleSignInHandoff.CONFIG_KEY, copy)
+        }
+        Diagnostics.info(
+            DiagChannel.LAUNCH, "GOOGLE_SIGN_IN_RETARGETED",
+            mapOf(
+                "action" to action,
+                "package" to guest,
+                "to" to hostPackage,
+                "fields" to fields.toString(),
+                "shape" to if (located.bundle != null) "bundle" else "extra",
+                // Present or absent, never the value. This is what says in advance whether
+                // to expect an account or a DEVELOPER_ERROR, so the next log explains
+                // itself instead of starting another investigation.
+                "serverToken" to
+                    if (GoogleSignInHandoff.requestsServerToken(copy)) "requested" else "no",
+                "detail" to "Play services refuses a request whose configuration names a " +
+                    "package other than the one that started the activity",
+            ),
+        )
+        return out
+    }
+
+    private fun notRetargeted(action: String, guestPackage: String, reason: String) {
+        Diagnostics.warn(
+            DiagChannel.LAUNCH, "GOOGLE_SIGN_IN_NOT_RETARGETED",
+            mapOf("action" to action, "package" to guestPackage, "reason" to reason),
+        )
+    }
+
+    /** The configuration object and the bundle it was in, if it was in one. */
+    private class SignInConfig(val config: Parcelable, val bundle: Bundle?)
+
+    /**
+     * Finds the configuration in either shape the client library writes it.
+     *
+     * `SignInHubActivity` reads its own through `getBundleExtra("config")` and writes the
+     * onward request with the object directly; which of the two a given release of
+     * `play-services-auth` produces is not worth depending on, and both are two lines.
+     */
+    private fun locateSignInConfig(intent: Intent): SignInConfig? = runCatching {
+        val bundle = intent.getBundleExtra(GoogleSignInHandoff.CONFIG_KEY)
+        if (bundle != null) {
+            @Suppress("DEPRECATION")
+            val inner = bundle.getParcelable<Parcelable>(GoogleSignInHandoff.CONFIG_KEY)
+            return@runCatching inner?.let { SignInConfig(it, bundle) }
+        }
+        @Suppress("DEPRECATION")
+        val direct = intent.getParcelableExtra<Parcelable>(GoogleSignInHandoff.CONFIG_KEY)
+        direct?.let { SignInConfig(it, null) }
+    }.getOrNull()
+
+    /**
+     * An independent copy of a `Parcelable`, made the way the platform would make one.
+     *
+     * Reflection on the original would be shorter and would mutate an object the guest
+     * still holds. A parcel round trip through the class's own `CREATOR` costs a few
+     * hundred bytes and leaves the app's copy alone.
+     */
+    private fun copyParcelable(value: Parcelable): Parcelable? {
+        val parcel = Parcel.obtain()
+        return try {
+            value.writeToParcel(parcel, 0)
+            parcel.setDataPosition(0)
+            @Suppress("UNCHECKED_CAST")
+            val creator = value.javaClass.getField("CREATOR")
+                .get(null) as Parcelable.Creator<Parcelable>
+            creator.createFromParcel(parcel)
+        } catch (error: Throwable) {
+            null
+        } finally {
+            parcel.recycle()
+        }
     }
 
     /** Settings screens an app opens *about itself*, all of them naming it in the data URI. */

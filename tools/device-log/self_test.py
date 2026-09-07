@@ -58,6 +58,8 @@ FIXTURE15 = os.path.join(HERE, "fixtures", "redmi-android15-run15.log")
 FIXTURE15_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run15.device.txt")
 FIXTURE16 = os.path.join(HERE, "fixtures", "redmi-android15-run16.log")
 FIXTURE16_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run16.device.txt")
+FIXTURE17 = os.path.join(HERE, "fixtures", "redmi-android15-run17.log")
+FIXTURE17_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run17.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -849,12 +851,21 @@ class RedmiRun13Test(unittest.TestCase):
         self.assertIn("never answered DEVELOPER_ERROR", text)
         self.assertNotIn("Google answered DEVELOPER_ERROR", text)
 
-    def test_google_is_the_only_failing_check(self):
+    def test_the_sign_in_was_refused_before_a_picker_could_be_drawn(self):
+        # Added after the seventeenth run, and this fixture is why it can be. Four
+        # attempts, each answered `CANCELED` in under a second — which is the measurement
+        # that says Play services refused the *request* rather than the user cancelling
+        # anything. It was read as "Google sign-in cannot work" for four runs.
+        detail = findings(self.checks["signin"])
+        self.assertIn("before an account picker could be drawn", detail)
+        self.assertIn("carrying the guest's own package name", detail)
+
+    def test_google_and_the_sign_in_are_the_failing_checks(self):
         failing = sorted(
             name for name, check in self.checks.items()
             if check.verdict == analyze.FAIL
         )
-        self.assertEqual(failing, ["google"])
+        self.assertEqual(failing, ["google", "signin"])
 
 
 class RedmiRun14Test(unittest.TestCase):
@@ -1052,9 +1063,193 @@ class RedmiRun16Test(unittest.TestCase):
         detail = findings(self.checks["paths"])
         self.assertIn("the published APK path does not open", detail)
 
-    def test_only_google_and_paths_fail(self):
+    def test_the_sign_in_refusal_is_the_same_one_and_is_timed(self):
+        # Five attempts here against the thirteenth run's four, and the same shape: the
+        # slowest came back in 0.47s. Nothing about the build changed between them for
+        # this flow, which is what makes the pair worth keeping.
+        detail = findings(self.checks["signin"])
+        self.assertIn("Play services refused the sign-in after 0.4", detail)
+
+    def test_only_google_the_sign_in_and_paths_fail(self):
         failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
-        self.assertEqual(failing, ["google", "paths"])
+        self.assertEqual(failing, ["google", "paths", "signin"])
+
+
+class RedmiRun17Test(unittest.TestCase):
+    """The seventeenth run: the code half is published, and SQLite is the whole of what is left.
+
+    This is the first log in which a guest was handed installed-shaped paths for its own
+    APK and they resolved:
+
+    ```
+    GUEST_PATHS_PUBLISHED package=com.axlebolt.standoff2 code=true slots=102 data=false
+        apk=/data/app/~~kx_uUO_2M6FP3W-o_gj5uw/com.axlebolt.standoff2-kROpHz2y_eD6hTS9Y0RvGQ
+    ```
+
+    `code=true` is what the sixteenth run's `libopenjdk.so`/`stat64` fix was for, and it
+    held on hardware. Three launches, three activities, nothing crashed, the `/proc` view
+    leaked nothing for either guest.
+
+    The data half refused, and the reason it refused is the finding. The same three lines
+    the fourteenth run produced are back, in a build that was supposed to have closed them:
+
+    ```
+    I UniqueNative: io_redirect: hooked libsqlite.so=2+abs
+    W SQLiteLog: (28) file renamed while open: /data/data/…/.unique-path-probe.db
+    E SQLiteLog: (1802) … disk I/O error
+    ```
+
+    Two slots is the PLT count on its own — `posixOpen` reaching `open`, and nothing else.
+    The `+abs` says absolute data relocations were *enabled* for this library, not that any
+    were found, and none were: Android links its platform libraries with packed
+    relocations, so `libsqlite.so` has no `DT_RELA` array for the patch to walk. The
+    mechanism was right about SQLite and wrong about the file format, and no log before
+    this one could have said so, because "patched nothing" and "there was nothing to
+    patch" printed the same number.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE17, FIXTURE17_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_the_code_half_published_for_the_first_time(self):
+        text = notes(self.checks["paths"])
+        self.assertIn("code paths published", text)
+        self.assertNotIn("no installed-shaped paths were published", findings(self.checks["paths"]))
+
+    def test_the_data_half_refused_on_a_database_and_not_on_a_file(self):
+        # The file probe passed and the database probe did not, which is the split the
+        # second probe exists for: `java.io` and SQLite reach the filesystem through
+        # different libraries and only one of them was covered.
+        text = notes(self.checks["paths"])
+        self.assertIn("SQLITE_IOERR_FSTAT", text)
+        self.assertNotIn("did not reach the instance", text)
+
+    def test_the_build_under_this_log_could_not_say_how_much_of_sqlite_was_redirected(self):
+        # The question the next run has to answer, and the reason `sqlite=` was added to
+        # the event. Absent is reported as absent rather than read as zero.
+        self.assertIn("does not report how much of SQLite was redirected",
+                      notes(self.checks["paths"]))
+
+    def test_nothing_the_sixteenth_run_fixed_regressed(self):
+        for name in ("engine", "launch", "slots", "crash", "native", "detection", "render"):
+            self.assertEqual(self.checks[name].verdict, analyze.PASS, name)
+
+    def test_no_sign_in_was_attempted_so_the_check_says_so(self):
+        # The user did not sign in during this run, and a check that reported a pass
+        # without saying that would read as "sign-in works now".
+        self.assertEqual(self.checks["signin"].verdict, analyze.PASS)
+        self.assertIn("no Google sign-in was attempted", notes(self.checks["signin"]))
+
+    def test_google_is_the_only_failing_check(self):
+        failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
+        self.assertEqual(failing, ["google"])
+
+
+SIGN_IN_RETARGETED = """\
+1788767460.000 10316 900 900 I Unique  : 2026-01-01 10:00:00.000 I PROCESS PROCESS_START \
+process=com.unique kind=CORE sdk=35 abi=arm64-v8a
+1788767460.100 10316 900 900 I Unique  : 2026-01-01 10:00:00.100 I LAUNCH \
+GOOGLE_SIGN_IN_RETARGETED action=com.google.android.gms.auth.GOOGLE_SIGN_IN \
+package=com.example.app to=com.unique fields=1 shape=bundle serverToken=no
+1788767460.200 10316 900 900 I Unique  : 2026-01-01 10:00:00.200 I LAUNCH \
+ACTIVITY_IMPLICIT_LEFT_GUEST action=com.google.android.gms.auth.GOOGLE_SIGN_IN data=- \
+package=com.example.app handledByHost=com.google.android.gms
+"""
+
+SIGN_IN_REFUSED_ANYWAY = SIGN_IN_RETARGETED + (
+    "1788767460.500 10316 900 900 D TokenPendingResult:  Calling onResult for callback. "
+    "result: Status: Status{statusCode=CANCELED, resolution=null} <null>\n"
+)
+
+SIGN_IN_CHOSEN_AND_REFUSED = SIGN_IN_RETARGETED + (
+    "1788767475.000 10316 900 900 D TokenPendingResult:  Calling onResult for callback. "
+    "result: Status: Status{statusCode=CANCELED, resolution=null} <null>\n"
+)
+
+
+class SignInRetargetTest(unittest.TestCase):
+    """What the sign-in check says once the request is rewritten.
+
+    The point of the rewrite is that Play services gets far enough to *show* something.
+    So the check has to distinguish three outcomes and not two: refused before a picker
+    could be drawn, refused long after one was, and no answer in this log at all. A tool
+    that called all three "sign-in failed" would report the fix working and the fix not
+    working with the same sentence.
+    """
+
+    def check_for(self, text: str) -> analyze.Check:
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        tmp.write(text)
+        tmp.close()
+        try:
+            parsed = analyze.load(tmp.name, None)
+            return {c.name: c for c in analyze.run_checks(parsed)}["signin"]
+        finally:
+            os.unlink(tmp.name)
+
+    def test_a_retargeted_request_with_no_answer_is_reported_and_is_not_a_failure(self):
+        check = self.check_for(SIGN_IN_RETARGETED)
+        self.assertEqual(check.verdict, analyze.PASS)
+        self.assertIn("retargeted to com.unique", notes(check))
+        self.assertIn("does not say what came back", notes(check))
+
+    def test_a_retargeted_request_refused_immediately_still_fails(self):
+        check = self.check_for(SIGN_IN_REFUSED_ANYWAY)
+        self.assertEqual(check.verdict, analyze.FAIL)
+        self.assertIn("still refused it after 0.30s", findings(check))
+
+    def test_a_refusal_slow_enough_for_a_person_is_not_the_identity_refusal(self):
+        # Fifteen seconds is somebody reading a list of accounts and backing out. Calling
+        # that the engine's fault is how a fixed flow gets reported as broken.
+        check = self.check_for(SIGN_IN_CHOSEN_AND_REFUSED)
+        self.assertEqual(check.verdict, analyze.PASS)
+        self.assertIn("long enough that a person saw the picker", notes(check))
+
+
+SQLITE_UNREDIRECTED = """\
+2026-01-01 10:00:00.000 I PROCESS PROCESS_START process=com.unique kind=CORE sdk=35 abi=arm64-v8a
+2026-01-01 10:00:03.000 W LAUNCH GUEST_PATHS_PUBLISHED package=com.example.app code=true \
+slots=102 sqlite=0 data=false apk=/data/app/~~a/com.example.app-b \
+detail=a database cannot be opened through the public path: SQLiteDiskIOException
+"""
+
+SQLITE_REDIRECTED = SQLITE_UNREDIRECTED.replace("sqlite=0", "sqlite=8")
+
+
+class SqliteRedirectTest(unittest.TestCase):
+    """Whether SQLite's own syscall table was replaced, which no slot count can say.
+
+    The seventeenth run's data half refused with `libsqlite.so=2+abs` above it, and the
+    two numbers together meant nothing to anybody: two patched slots is a healthy PLT
+    count and `+abs` names an attempt rather than a result. `sqlite=` is the number that
+    settles it, and these pin what each value means.
+    """
+
+    def check_for(self, text: str) -> analyze.Check:
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        tmp.write(text)
+        tmp.close()
+        try:
+            parsed = analyze.load(tmp.name, None)
+            return {c.name: c for c in analyze.run_checks(parsed)}["paths"]
+        finally:
+            os.unlink(tmp.name)
+
+    def test_a_database_refusal_with_no_syscalls_replaced_fails(self):
+        check = self.check_for(SQLITE_UNREDIRECTED)
+        self.assertEqual(check.verdict, analyze.FAIL)
+        self.assertIn("none of SQLite's own system calls were replaced", findings(check))
+
+    def test_a_database_refusal_with_syscalls_replaced_is_a_different_fault(self):
+        check = self.check_for(SQLITE_REDIRECTED)
+        self.assertEqual(check.verdict, analyze.PASS)
+        self.assertIn("the fault is downstream of the redirect", notes(check))
 
 
 HEALTHY = """\

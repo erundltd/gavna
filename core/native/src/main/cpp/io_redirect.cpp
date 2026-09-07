@@ -16,6 +16,7 @@
 
 #include "plt_hook.h"
 #include "proc_view.h"
+#include "sqlite_vfs.h"
 #include "redirect_table.h"
 #include "unique_native.h"
 
@@ -266,6 +267,16 @@ int h_openat(int dirfd, const char* path, int flags, ...) {
                                : ::openat(dirfd, target, flags, mode);
 }
 
+/// `open` with SQLite's signature rather than libc's.
+///
+/// `aSyscall[]` calls its entries through a fixed prototype —
+/// `int (*)(const char*, int, int)` — and the varargs trampoline above is not that type.
+/// Calling one through the other happens to work on AAPCS64 and is undefined by the
+/// language; a three-argument wrapper costs one jump and removes the question.
+int h_open_fixed(const char* path, int flags, int mode) {
+    return h_open(path, flags, mode);
+}
+
 #define UNIQUE_TRAMPOLINE_1(name, ret, sig_type)                       \
     ret h_##name(const char* path) {                                   \
         std::string holder;                                            \
@@ -488,6 +499,13 @@ std::vector<std::string> g_excludes;
 int g_slots_patched = 0;
 bool g_watching = false;
 
+/// Whether SQLite's own syscall table has been replaced in this process.
+///
+/// Retried on every pass until it takes: `libsqlite.so` is mapped when the first database
+/// is opened, which for a guest that opens one from `Application.onCreate` is after the
+/// graft and for one that never opens a database is never.
+bool g_sqlite_replaced = false;
+
 // The loader entry points, captured when the watch is installed.
 void* (*o_android_dlopen_ext)(const char*, int, const void*, const void*) = nullptr;
 void* (*o_dlopen)(const char*, int) = nullptr;
@@ -584,6 +602,8 @@ int exclusion_count() {
 }
 
 int slots_patched() { return g_slots_patched; }
+
+int sqlite_calls_replaced() { return sqlite_vfs::replaced(); }
 
 /// Installs the interception into the libraries named by set_scope().
 ///
@@ -743,6 +763,31 @@ InstallStatus install_locked() {
             ULOGI("io_redirect: nothing in this process imports: %s", missing.c_str());
         }
     }
+    // SQLite, through its own interface rather than through its relocations.
+    //
+    // Repeated until it takes and then left alone. Reported either way and in one line,
+    // because "SQLite was not redirected" and "SQLite has not been loaded yet" produce
+    // the same behaviour and only one of them is a fault. See sqlite_vfs.h.
+    if (!g_sqlite_replaced) {
+        static const sqlite_vfs::Override kSqliteCalls[] = {
+                {"open", reinterpret_cast<void*>(h_open_fixed)},
+                {"access", reinterpret_cast<void*>(h_access)},
+                {"stat", reinterpret_cast<void*>(h_stat)},
+                {"lstat", reinterpret_cast<void*>(h_lstat)},
+                {"unlink", reinterpret_cast<void*>(h_unlink)},
+                {"mkdir", reinterpret_cast<void*>(h_mkdir)},
+                {"rmdir", reinterpret_cast<void*>(h_rmdir)},
+                {"readlink", reinterpret_cast<void*>(h_readlink)},
+        };
+        const auto sqlite = sqlite_vfs::install(
+                kSqliteCalls, sizeof(kSqliteCalls) / sizeof(kSqliteCalls[0]));
+        g_sqlite_replaced = sqlite.replaced > 0;
+        ULOGI("io_redirect: sqlite %d/%d system call(s) replaced (library=%s api=%s "
+              "vfs=v%d) %s",
+              sqlite.replaced, sqlite.attempted, sqlite.library_found ? "yes" : "no",
+              sqlite.api_found ? "yes" : "no", sqlite.vfs_version, sqlite.detail.c_str());
+    }
+
     if (report.libraries_matched == 0) {
         for (const auto& filter : filters) {
             ULOGW("io_redirect: filter did not match: %s", filter.c_str());

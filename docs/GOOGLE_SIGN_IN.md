@@ -9,7 +9,7 @@ are two answers, not one:
 
 | The SDK asks | Example | Where UNIQUE stands |
 |---|---|---|
-| **Play services** — another process, resolving the caller by kernel uid | Google Sign-In | Not through the route UNIQUE takes today. **Not proven impossible** — see the note below |
+| **Play services** — another process, resolving the caller by kernel uid | Google Sign-In | Two walls, not one. The first — a request whose configuration names a different package from the one that started the activity — is **corrected as of this build** (§0); the second is §1's OAuth client, and is not |
 | **the app's own `PackageManager`** | Facebook, VK, most SDKs | **Already correct** — proven on the phone in §3 |
 
 > **A claim made here was too strong, and is withdrawn.** This document said Google sign-in
@@ -22,11 +22,83 @@ are two answers, not one:
 > difference matters. **How another engine gets a Google sign-in through is now the most
 > valuable unknown in this file**, and it is answerable: one log from such an engine, doing
 > a sign-in that works, would show the route.
+>
+> **And it is partly answered now, by this project's own logs rather than someone else's.**
+> §0 times the refusal at under half a second with no picker drawn, which is a different
+> event from the one §1 describes and is not evidence of it. The user's account —
+> "the picker returns, the login completes" — is consistent with an engine that makes the
+> request self-consistent, which is what §0 now does. That does not make §1 wrong; it
+> means §1 was never the wall being hit.
 
 So "you cannot sign in inside a virtual space" is false as a general statement, and may be
 false even for Google. For Standoff 2 the shortest route UNIQUE can build today is Facebook
 or VK (§3) — but the thing that actually stops the game being playable is what comes
 *after* the login, not the login.
+
+---
+
+## 0. What the logs actually timed, which is not what this document said
+
+Every version of this file before the seventeenth run described one wall: Play services
+resolves its caller by kernel uid, the OAuth client is registered against a package and a
+signing certificate, and the answer is `DEVELOPER_ERROR`. That wall is real and §1 still
+describes it correctly. **It is not the one Standoff 2 hits.**
+
+The thirteenth and sixteenth phone logs both contain sign-in attempts. Read for their
+*timing* rather than their outcome, they say something the outcome alone cannot:
+
+```
+ACTIVITY_IMPLICIT_LEFT_GUEST action=com.google.android.gms.auth.GOOGLE_SIGN_IN   …460.307
+D TokenPendingResult:  … Status{statusCode=CANCELED, resolution=null}            …460.686
+```
+
+0.38 s, 0.47 s, 0.31 s, 0.23 s, 0.25 s — five attempts in the sixteenth run, four more in
+the thirteenth. **No account picker was ever drawn.** Nobody chose an account and nobody
+cancelled; the request was refused and returned. `DEVELOPER_ERROR` never appears in either
+log, because nothing ever got far enough to ask for a token.
+
+What is refused is simpler and earlier. The client library builds its request out of the
+app's own context:
+
+```java
+// play-services-auth, bundled in the guest's own APK
+new SignInConfiguration(context.getPackageName(), googleSignInOptions)
+```
+
+Inside UNIQUE `context.getPackageName()` answers `com.axlebolt.standoff2`, correctly —
+that is the graft doing its job. The package that actually **started** the activity is
+`com.unique`, because a `:vappN` process is UNIQUE and no rewriting changes a uid. Play
+services compares the two, and a caller claiming to be a package it is not is precisely
+what that comparison exists to refuse.
+
+So the request is now made self-consistent on the way out, by
+`core/google/…/GoogleSignInHandoff.kt` and `VirtualActivityTaskManagerHook`: the
+configuration is copied, the field whose value is the guest's package name is replaced
+with `com.unique` — the truthful answer to "who started this activity", and the same
+correction `GmsBrokerBinder` already makes on every service bind — and the change is
+reported:
+
+```
+GOOGLE_SIGN_IN_RETARGETED action=…GOOGLE_SIGN_IN package=com.axlebolt.standoff2
+    to=com.unique fields=1 shape=bundle serverToken=requested
+```
+
+**This is expected to reach §1's wall, not to remove it.** With the picker drawn:
+
+| The app asked for | What Google can answer for `com.unique` |
+|---|---|
+| id, email, display name, photo (`DEFAULT_SIGN_IN`) | all of it — no OAuth client is involved |
+| `requestIdToken(serverClientId)` / `requestServerAuthCode(...)` | `DEVELOPER_ERROR` (10), for the reason in §1 |
+
+Which of the two an app is in is a property of its own `GoogleSignInOptions`, so
+`serverToken=requested|no` is reported *before* Google answers. Stripping the token request
+to force a "success" was considered and rejected: an app handed an account without the
+token it asked for fails later, on its own server, in a way nobody holding the phone can
+read.
+
+**Status: unverified.** No phone has yet run a build carrying this. The `signin` check in
+`tools/device-log/analyze.py` is what will settle it, and it reads the gap: under two
+seconds is the refusal above, longer means a person saw a list of accounts.
 
 ---
 
@@ -271,6 +343,12 @@ Recorded so that each is not re-proposed:
 `core/google` reports `UNSUPPORTED` for `SIGN_IN` and `OAUTH_WEB`, with the reason named in
 the rationale string rather than a mode that reads as working. That is deliberate: a sentence
 saying what to do instead is worth more than a code path that fails at the end.
+
+That rationale is **still what the router says, and it is now incomplete rather than
+wrong**: it names §1's OAuth-client wall, which no phone has yet reached, and says nothing
+about the refusal §0 measures, which every phone reached instead. It is left as it is until
+a run says which of the two an app actually meets — moving `SIGN_IN` out of `UNSUPPORTED`
+on the strength of a fix nobody has run would be exactly the thing rule 2 forbids.
 
 The path work in `GuestIdentityPaths` closes the **virtual-space verdict** — the
 `AppVerification` report that rides on `GoogleAuthRequest` and names the APK's path. It does

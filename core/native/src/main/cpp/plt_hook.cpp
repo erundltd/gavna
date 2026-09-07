@@ -79,6 +79,26 @@ bool is_address_slot(unsigned type, ElfW(Sxword) addend, bool absolute_allowed) 
 
 std::mutex g_mutex;
 
+/// Android's packed `.rela.dyn`, which is not an array of relocations at all.
+///
+/// The platform links its own libraries with `--pack-dyn-relocs`, which replaces
+/// `DT_RELA` with an APS2-encoded blob under this tag. A scan that reads only `DT_RELA`
+/// therefore sees such a library as having *no* data relocations — indistinguishable, in
+/// every number it reports, from one that genuinely has none.
+///
+/// That is not a hypothesis about the device: it is what has to be true for
+/// `io_redirect: hooked libsqlite.so=2+abs` in the seventeenth phone run, where two is
+/// the PLT count alone and the absolute-relocation patch was already in the build. The
+/// tag is read here so the next log states it rather than implying it, and nothing is
+/// patched differently because of it — the SQLite path that mattered goes through
+/// `sqlite_vfs.h` instead, which does not depend on the format at all.
+#ifndef DT_ANDROID_RELA
+#define DT_ANDROID_RELA 0x60000012
+#endif
+#ifndef DT_ANDROID_RELASZ
+#define DT_ANDROID_RELASZ 0x60000013
+#endif
+
 /// Everything one library's dynamic section tells us about its relocations.
 struct DynamicInfo {
     const Rela* plt_rela = nullptr;
@@ -87,6 +107,9 @@ struct DynamicInfo {
     size_t rela_count = 0;
     const Sym* symtab = nullptr;
     const char* strtab = nullptr;
+    /// True when this library's non-PLT relocations are packed and therefore unreadable
+    /// as an array. Reported, never worked around here.
+    bool packed_rela = false;
 };
 
 DynamicInfo read_dynamic(const ElfW(Dyn)* dyn, ElfW(Addr) base) {
@@ -117,6 +140,9 @@ DynamicInfo read_dynamic(const ElfW(Dyn)* dyn, ElfW(Addr) base) {
                 break;
             case DT_STRTAB:
                 info.strtab = reinterpret_cast<const char*>(base + dyn->d_un.d_ptr);
+                break;
+            case DT_ANDROID_RELA:
+                info.packed_rela = true;
                 break;
             default:
                 break;
@@ -164,6 +190,9 @@ struct ScanContext {
     int here = 0;
     /// Whether absolute data relocations are patched in the library being walked.
     bool absolute_here = false;
+    /// Whether the library being walked keeps its non-PLT relocations packed, and so has
+    /// no relocation array for the absolute patch to reach.
+    bool packed_here = false;
 };
 
 bool path_matches(const char* path, const std::vector<std::string>& filters) {
@@ -294,6 +323,7 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
     ctx->seen->push_back(key);
 
     ctx->here = 0;
+    ctx->packed_here = false;
     ctx->absolute_here = path_matches(info->dlpi_name, *ctx->abs64_libraries) &&
                          !ctx->abs64_libraries->empty();
     for (int i = 0; i < info->dlpi_phnum; ++i) {
@@ -301,6 +331,7 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
         if (phdr.p_type != PT_DYNAMIC) continue;
         const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(info->dlpi_addr + phdr.p_vaddr);
         DynamicInfo dynamic = read_dynamic(dyn, info->dlpi_addr);
+        if (dynamic.packed_rela) ctx->packed_here = true;
         patch_relocations(dynamic.plt_rela, dynamic.plt_rela_count, dynamic,
                           info->dlpi_addr, ctx);
         patch_relocations(dynamic.rela, dynamic.rela_count, dynamic,
@@ -311,7 +342,8 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
         const char* base = (name == nullptr) ? "" : strrchr(name, '/');
         ctx->report->per_library.emplace_back(
                 std::string(base != nullptr ? base + 1 : (name == nullptr ? "?" : name)) +
-                "=" + std::to_string(ctx->here) + (ctx->absolute_here ? "+abs" : ""));
+                "=" + std::to_string(ctx->here) + (ctx->absolute_here ? "+abs" : "") +
+                (ctx->packed_here ? "+packed" : ""));
     }
     return 0;
 }

@@ -86,6 +86,13 @@ InstallStatus install();
 bool installed();
 // GOT entries actually patched by the last install().
 int slots_patched();
+// Entries of SQLite's own syscall table replaced through `xSetSystemCall`.
+//
+// Separate from slots_patched() because it is a different mechanism answering a different
+// question: SQLite holds libc addresses in data rather than calling them, and on a
+// platform library linked with packed relocations there is no relocation array to patch.
+// Zero means every database a guest opens reaches the real filesystem. See sqlite_vfs.h.
+int sqlite_calls_replaced();
 // Re-hooks automatically when a library is loaded after install(). Idempotent.
 InstallStatus watch_library_loads();
 bool watching();

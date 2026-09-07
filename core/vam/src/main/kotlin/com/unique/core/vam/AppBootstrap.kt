@@ -1135,6 +1135,31 @@ object AppBootstrap {
         // Binder and zip: parcelled paths and APK reads.
         "libbinder.so",
         "libz.so",
+        // WebView's renderer, which runs *in this process* and writes under the guest's
+        // own data directory.
+        //
+        // The nineteenth run is why it is here, and it is the data half's version of the
+        // fault the code half had one run earlier. With `data=true`, ChatGPT was told its
+        // cache is `/data/user/0/com.openai.chatgpt/cache`; `libwebviewchromium.so` — an
+        // ordinary app library loaded from the WebView package's APK, and not in this
+        // list — took that at face value:
+        //
+        //   E chromium: [ERROR:crashpad/util/file/filesystem_posix.cc:63]
+        //       mkdir /data/user/0/com.openai.chatgpt/cache/webview_vapp0/Crashpad:
+        //       No such file or directory (2)
+        //   F libc: Fatal signal 5 (SIGTRAP), code 1 (TRAP_BRKPT) … (.openai.chatgpt)
+        //
+        // The directory could not be created because its parent chain exists only inside
+        // the instance, and the library asking was outside the redirect. Chromium does not
+        // degrade when its crash handler cannot be set up; it fails a `CHECK` and traps.
+        // The same app ran without this in the twelfth and fourteenth runs, both of which
+        // had `data=false`.
+        //
+        // `libmonochrome.so` is the same code under the name the Trichrome and Chrome
+        // WebView providers use, which is what a different phone will have.
+        "libwebviewchromium.so",
+        "libmonochrome.so",
+        "libmonochrome_64.so",
     )
 
     /** What [armIoRedirection] published, so [installIoRedirection] can report it. */

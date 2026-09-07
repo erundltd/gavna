@@ -60,7 +60,7 @@ exist because a claim was made without evidence and a later phone log contradict
 - `/proc/self/maps` inside a guest no longer names UNIQUE — `PROC_VIEW_INSTALLED …
   named=16 leaked=0` on the phone, and the graft checks its own work.
 - Two instances of one app have separate identities, storage and `ANDROID_ID`.
-- 302 JVM tests, 142 host-side native checks, 125 device-log tests, 17 APK-survey tests, 15
+- 302 JVM tests, 142 host-side native checks, 129 device-log tests, 17 APK-survey tests, 15
   Dart tests. All passing.
 
 ### Does not work
@@ -92,7 +92,7 @@ The NDK is installed by Gradle on first native build. AGP 8.13.0, Kotlin 2.2.20.
 ./gradlew test                    # 302 JVM tests
 ./tools/native-test/run.sh        # 142 native checks; 38 need an NDK and skip without one
 (cd ui && flutter test)           # 15 Dart tests
-./tools/device-log/self_test.py   # 125 tests for the log analyzer, no toolchain
+./tools/device-log/self_test.py   # 129 tests for the log analyzer, no toolchain
 ./tools/apk-survey/self_test.py   # 17 tests
 ./tools/check-translations.py     # every engine failure has both languages
 ./tools/report-unimplemented.sh   # every deliberately unimplemented surface
@@ -201,17 +201,24 @@ Neither half is applied until it is measured:
 
 `GUEST_PATHS_PUBLISHED package=… code=… data=… slots=… apk=… detail=…` reports both.
 
-**Current state: `code=true`, `data=true`** — measured on the phone, run 18, with
-`sqlite=8`. Both halves of the identity a guest reports for itself are published and both
-round-trip.
+**Current state: `code=true`, `data=true`** — measured on the phone, runs 18 and 19, with
+`sqlite=8`, for two different applications. Both halves of the identity a guest reports for
+itself are published and both round-trip.
 
 **And that is not the same as working.** In the same run the game showed *"Not enough
 storage space to install required resources"*, because `libunity.so` could not open the
 APK path UNIQUE had just published to it. The gate that decides whether to publish asks
 `java.io.File`, which the redirect covers; the caller that failed was the guest's own,
-which it did not. Two causes, both fixed and both **untested**: `__open_2` (§6) and a
-library-load watch that was never re-armed (§6). Until a run says otherwise, treat
-`code=true data=true` as *published*, not as *safe*.
+which it did not. Two causes, both fixed and both **untested** — run 19 closed the game before its engine
+loaded, so there is no `I Unity:` line in it at all: `__open_2` (§6) and a library-load
+watch that was never re-armed (§6).
+
+Run 19 then found the same shape in the data half: WebView's renderer runs in the guest's
+process, was handed the published cache directory, could not create a directory under it,
+and **trapped** — `SIGTRAP` from a chromium `CHECK`, taking ChatGPT with it.
+`libwebviewchromium.so` is in the scope now. Until a run says otherwise, treat
+`code=true data=true` as *published*, not as *safe*: it is a path for the libraries the
+redirect reaches and a dead end for the rest, and every run so far has named one more.
 
 The virtual-space notice has still never been observed with the paths intact, and it only
 appears after a login, so a run without one proves nothing.
@@ -331,6 +338,8 @@ This is where most of the recent work happened and where the next bug will proba
 | named list derived from run 15's own per-library output | 16 | the code gate still refused — see below |
 | + `libopenjdk.so` and the large-file symbol spellings | 17 | **`code=true`.** The scope is right now; what was left was not a scope problem at all |
 | SQLite through `xSetSystemCall`, not through relocations | 18 | **`data=true`, `sqlite=8`** — and the game could not open the path it had been given, for two reasons that are not about scope either |
+| + `__open_2`, the re-armed load watch | 19 | Sentry and Conscrypt hooked for the first time; `libunity.so` never loaded, so the fault it was for is still unanswered. **WebView's renderer** was handed the published *data* path, could not create a directory under it, and trapped |
+| + `libwebviewchromium.so` and the Trichrome names | 19 | untested |
 
 **The lesson from run 15, which is the important one**: the safety argument ("no rule can
 match `/data/user/0/com.unique`, so a hooked library touching UNIQUE's files is unaffected")
@@ -441,7 +450,7 @@ phone run is checked in as a fixture under `tools/device-log/fixtures/` with ass
 `self_test.py`, so **a check that stops reporting a fault a real phone produced is a
 regression in the tool** rather than progress in the engine.
 
-Sixteen captures are checked in — the first run, then runs 4 through 18; runs 2 and 3
+Seventeen captures are checked in — the first run, then runs 4 through 19; runs 2 and 3
 predate the analyzer and were never kept. When a new log arrives:
 
 1. run the analyzer;
@@ -456,15 +465,23 @@ predate the analyzer and were never kept. When a new log arrives:
 
 ## 8. What to do next, in order
 
-1. **The nineteenth run**, and the first question is whether the game starts at all.
+1. **The twentieth run**, and the first question is still whether the game starts at all.
+   Run 19 did not answer it: the game was closed eight seconds in, before `libunity.so`
+   loaded, so there is no `I Unity:` line in that log.
    - **No "Not enough storage space" dialog**, and no `E Unity: ApkAddCentralDirectory`
      in the log. That is the whole of what the two fixes above are for. If it is still
      there, the log now names the library that patched nothing —
      `io_redirect: hooked libunity.so=0+packed` — and the answer is a symbol the table
      still does not have, not a rescan that did not run.
    - **`io_redirect: hooked … after loading …/libunity.so`.** Its presence is the watch
-     re-arm working. Its absence with a working game means Unity was covered by the
+     re-arm working — run 19 showed it working for Sentry and Conscrypt, which no earlier
+     log had ever hooked. Its absence with a working game means Unity was covered by the
      initial scan instead.
+   - **ChatGPT, or anything with a WebView.** Run 19 killed it: `libwebviewchromium.so`
+     runs in the guest's process, was handed the published cache directory, could not
+     create a directory under it, and trapped. It is in the scope now. What to watch for is
+     the app staying up and no `mkdir /data/user/0/<pkg>/…: No such file or directory` from
+     `chromium` — the `paths` check reads that shape now and fails on it.
    - **Google sign-in.** Tap the Google button in Standoff 2. Watch for
      `GOOGLE_SIGN_IN_RETARGETED … to=com.unique serverToken=…` and then for whether an
      account picker appears at all. The `signin` check times the answer: under two seconds

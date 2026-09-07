@@ -450,6 +450,17 @@ _PATH_UNOPENABLE = re.compile(
     r"[Uu]nable to open '(/data/app/~~[A-Za-z0-9_-]+/[^']+)'"
 )
 
+# And the third shape, which is about the *data* half rather than the code half.
+#
+# A directory creation that fails with ENOENT under a path UNIQUE published is never the
+# app's fault and never legitimate: it means the parent chain exists only inside the
+# instance, so the caller is outside the redirect. WebView's renderer is the first one
+# found this way, in the nineteenth run, and it does not degrade when it happens —
+# chromium fails a `CHECK` and traps, taking the app with it.
+_PATH_MKDIR_FAILED = re.compile(
+    r"mkdir (/data/(?:user/\d+|data)/[^\s:]+): No such file or directory"
+)
+
 
 def check_guest_paths(run: Run) -> Check:
     """Did the paths a guest was told it has actually resolve?
@@ -529,18 +540,31 @@ def check_guest_paths(run: Run) -> Check:
     # The published paths, as this run actually spelled them, so a failure naming one is
     # matched against what was published rather than against a shape.
     prefixes = {e["apk"] for e in published if e["apk"]}
+    # The data half's published spellings, which the event does not carry because they are
+    # arithmetic: `/data/user/0/<package>` and the `/data/data` alias of the same thing.
+    for event in published:
+        if (event["data"] or "false") != "true" or not event["package"]:
+            continue
+        prefixes.add(f"/data/user/0/{event['package']}")
+        prefixes.add(f"/data/data/{event['package']}")
     reported: Set[str] = set()
     for line in run.lines:
         if line.tag == UNIQUE_TAG:
             continue
         m = _PATH_FAILED.search(line.message) if "failed" in line.message else None
-        if m is None:
-            unopenable = _PATH_UNOPENABLE.search(line.message)
-            if unopenable is None:
-                continue
-            path, reason = unopenable.group(1), "the caller could not open it"
-        else:
+        if m is not None:
             path, reason = m.group(1), m.group(2).strip()
+        else:
+            unopenable = _PATH_UNOPENABLE.search(line.message)
+            if unopenable is not None:
+                path, reason = unopenable.group(1), "the caller could not open it"
+            else:
+                nodir = _PATH_MKDIR_FAILED.search(line.message)
+                if nodir is None:
+                    continue
+                path = nodir.group(1)
+                reason = ("the directory could not be created — its parent exists only "
+                          "inside the instance, so the caller is outside the redirect")
         if not any(path.startswith(prefix) for prefix in prefixes):
             continue
         key = f"{line.tag}:{reason}"
@@ -1437,7 +1461,31 @@ def check_native_hooks(run: Run) -> Check:
             line.lineno,
             line.message.strip()[:160],
         )
+        # And say when there is a better suspect than "the last library loaded".
+        #
+        # This pairing is a heuristic and the nineteenth run is where it pointed at the
+        # wrong thing: it named Sentry and Conscrypt, and the app had died because
+        # WebView could not create a directory under a path UNIQUE had published to it,
+        # two lines earlier. Excluding a library that was not the cause costs a round.
+        if _published_path_failed(run):
+            check.note(
+                f"{package}: a path UNIQUE published also failed in this run — see the "
+                f"`paths` check, which names the caller. That is the likelier cause, and "
+                f"an exclusion here would not fix it"
+            )
     return check
+
+
+def _published_path_failed(run: Run) -> bool:
+    """Whether any caller reported a published path it could not use."""
+    for line in run.lines:
+        if line.tag == UNIQUE_TAG:
+            continue
+        if (_PATH_UNOPENABLE.search(line.message)
+                or _PATH_MKDIR_FAILED.search(line.message)
+                or ("failed" in line.message and _PATH_FAILED.search(line.message))):
+            return True
+    return False
 
 
 _TOP_FRAME = re.compile(r"#00 pc [0-9a-f]+\s+(\S+)")

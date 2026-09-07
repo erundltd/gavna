@@ -168,6 +168,21 @@ read now, and runs 17 and 18 fail on it — which is the point: a published path
 own code cannot open is worse than a path that was never published, because it works for
 the callers the redirect reaches and not for the rest.
 
+The nineteenth run added the third shape, which is about the *data* half. A directory
+creation under a published path failing with `ENOENT` is never legitimate — it means the
+parent chain exists only inside the instance, so the caller is outside the redirect:
+
+```
+E chromium: mkdir /data/user/0/com.openai.chatgpt/cache/webview_vapp0/Crashpad:
+            No such file or directory (2)
+F libc: Fatal signal 5 (SIGTRAP) … (.openai.chatgpt)
+```
+
+That run also showed the `native` check pointing at the wrong library: it pairs a crash
+with whatever was hooked most recently, which was Sentry and Conscrypt, and the cause was
+two lines above in `paths`. It cross-references `paths` now rather than sending the next
+round to an exclusion that would not have helped.
+
 ### The one the seventeenth run added: `signin`
 
 Separate from `google`, and the separation is the finding. `google` asks whether a guest

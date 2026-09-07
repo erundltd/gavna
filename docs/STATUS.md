@@ -53,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 142 off-device tool tests — all passing.**
+**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 146 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1613,6 +1613,61 @@ was the guest's own, which it did not.
 The per-library line also names a guest's own library that patched **nothing**
 (`libunity.so=0+packed`), because "never scanned" and "scanned and matched no symbol" are
 a missing rescan and a missing symbol respectively, and they printed the same absence.
+
+### The nineteenth run: the data half is published for two apps, and WebView traps
+
+Read for what it settles and what it does not, because the second is the part that is easy
+to overstate.
+
+**Settled.** Two apps, both `code=true slots=120 sqlite=8 data=true`. The per-library line
+now names a guest's own library that patched *nothing* — `libmain.so=0`,
+`libcrashlytics.so=0`, `libdatastore_shared_counter.so=0` — so "never scanned" and
+"scanned and matched no symbol" are finally two different answers rather than one absence.
+And `libsentry.so=10`, `libsentry-android.so=1` and `libconscrypt_jni.so=2` are hooked for
+the first time in any log, through the rescan the re-armed load watch fires:
+
+```
+io_redirect: hooked 10 new slot(s) after loading …/libsentry.so
+```
+
+**Not settled, and this matters.** `libunity.so` never loaded — there is no `I Unity:` line
+in this log at all. The game was launched, reached its own activity, and was closed eight
+seconds later. So the absence of `ApkAddCentralDirectory : Unable to open` here is **not**
+evidence that the `__open_2` fix worked. The eighteenth run's fault is still unanswered.
+
+**New, and located to the line.** With the data path published, ChatGPT died:
+
+```
+E chromium: [ERROR:crashpad/util/file/filesystem_posix.cc:63]
+    mkdir /data/user/0/com.openai.chatgpt/cache/webview_vapp0/Crashpad:
+    No such file or directory (2)
+F libc: Fatal signal 5 (SIGTRAP), code 1 (TRAP_BRKPT) … (.openai.chatgpt)
+```
+
+This is the data half's version of the fault the code half had one run earlier.
+`libwebviewchromium.so` runs **in the guest's process** — the in-process WebView — was
+handed the guest's published cache directory, and is not in `PLATFORM_IO_LIBRARIES`. The
+directory it wanted to create has a parent chain that exists only inside the instance, so
+the `mkdir` reached the real filesystem and found nothing. Chromium does not degrade when
+its crash handler cannot be set up: it fails a `CHECK` and traps, and the app goes with it.
+The same app ran without this in the twelfth and fourteenth runs, both of which had
+`data=false`.
+
+`libwebviewchromium.so` is in the scope now, with `libmonochrome.so` and
+`libmonochrome_64.so` — the same code under the names the Trichrome and Chrome WebView
+providers use on other phones.
+
+**Two things the analyzer had to learn from this.**
+
+*A `mkdir` under a published path failing with `ENOENT` is never legitimate.* It means the
+parent chain exists only in the instance, so the caller is outside the redirect. `paths`
+reads that shape now, and it reads the *data* half's published prefixes as well as the
+APK's — which the event does not carry, because they are arithmetic on the package name.
+
+*And the `native` check pointed at the wrong library.* It pairs a native crash with
+whatever was hooked most recently, which here was Sentry and Conscrypt; acting on that
+would have excluded a library that was not the cause and cost a round. It cross-references
+`paths` now and says so.
 
 ### Signing in: the refusal happens before the account picker, and that is measurable
 

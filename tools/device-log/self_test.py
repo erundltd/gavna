@@ -62,6 +62,8 @@ FIXTURE17 = os.path.join(HERE, "fixtures", "redmi-android15-run17.log")
 FIXTURE17_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run17.device.txt")
 FIXTURE18 = os.path.join(HERE, "fixtures", "redmi-android15-run18.log")
 FIXTURE18_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run18.device.txt")
+FIXTURE19 = os.path.join(HERE, "fixtures", "redmi-android15-run19.log")
+FIXTURE19_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run19.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -1297,6 +1299,69 @@ detail=a database cannot be opened through the public path: SQLiteDiskIOExceptio
 """
 
 SQLITE_REDIRECTED = SQLITE_UNREDIRECTED.replace("sqlite=0", "sqlite=8")
+
+
+class RedmiRun19Test(unittest.TestCase):
+    """The nineteenth run: the data half is published for two apps, and WebView traps.
+
+    What it settles and what it does not, in that order, because the second is the part
+    that is easy to overstate.
+
+    **Settled.** Two apps, both with `code=true sqlite=8 data=true`, and the per-library
+    line now names a guest's own library that patched nothing — `libmain.so=0`,
+    `libcrashlytics.so=0` — so "never scanned" and "scanned and matched no symbol" are
+    finally distinguishable. `libsentry.so=10` and `libconscrypt_jni.so=2` are hooked for
+    the first time, which is the re-armed load watch working: neither appears in any
+    earlier log.
+
+    **Not settled.** `libunity.so` never loaded — there is no `I Unity:` line in this log
+    at all — so the game was closed before its engine started. The absence of
+    `ApkAddCentralDirectory : Unable to open` here is therefore *not* evidence that the
+    `__open_2` fix worked. That question is still open.
+
+    **New, and precisely located.** With the data path published, ChatGPT died:
+
+    ```
+    E chromium: [ERROR:crashpad/util/file/filesystem_posix.cc:63]
+        mkdir /data/user/0/com.openai.chatgpt/cache/webview_vapp0/Crashpad:
+        No such file or directory (2)
+    F libc: Fatal signal 5 (SIGTRAP), code 1 (TRAP_BRKPT) … (.openai.chatgpt)
+    ```
+
+    `libwebviewchromium.so` runs in this process, was handed the guest's published cache
+    directory, and is not in the redirect's scope — so the parent chain it needed exists
+    only inside the instance. Chromium does not degrade when its crash handler cannot be
+    set up; it fails a `CHECK` and traps. The same app ran without this in the twelfth and
+    fourteenth runs, both of which had `data=false`.
+
+    It is the data half's version of the fault the code half had one run earlier, and the
+    `native` check pointed at the wrong thing — Sentry and Conscrypt, because they were the
+    last libraries hooked — which is why it now cross-references `paths`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE19, FIXTURE19_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_both_halves_published_for_both_apps(self):
+        text = notes(self.checks["paths"])
+        self.assertIn("com.axlebolt.standoff2: code and data paths both published", text)
+        self.assertIn("com.openai.chatgpt: code and data paths both published", text)
+
+    def test_the_webview_failure_is_named_with_its_caller_and_its_reason(self):
+        detail = findings(self.checks["paths"])
+        self.assertIn("did not resolve for chromium", detail)
+        self.assertIn("its parent exists only inside the instance", detail)
+
+    def test_the_native_check_says_it_is_not_the_likeliest_cause(self):
+        # It names Sentry and Conscrypt because they were hooked last. Acting on that
+        # would exclude a library that was not the cause and cost a round.
+        self.assertIn("an exclusion here would not fix it", notes(self.checks["native"]))
+
+    def test_the_engine_itself_did_not_regress(self):
+        for name in ("engine", "launch", "slots", "detection", "render", "signin"):
+            self.assertEqual(self.checks[name].verdict, analyze.PASS, name)
 
 
 PUBLISHED_THEN_UNOPENABLE = """\

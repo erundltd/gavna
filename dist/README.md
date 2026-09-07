@@ -64,6 +64,132 @@ install over them.
 
 ## What changed since the last phone run
 
+Твой лог впервые показал то, ради чего делались три предыдущие сборки, — и заодно показал,
+что одна из них вообще не работала.
+
+### Хорошее: пути к APK наконец публикуются и открываются
+
+```
+GUEST_PATHS_PUBLISHED package=com.axlebolt.standoff2 code=true slots=102 data=false
+```
+
+`code=true` — это первый раз за всё время. Игре теперь сообщается путь вида
+`/data/app/~~…/com.axlebolt.standoff2-…/base.apk`, и этот путь **реально открывается**.
+Именно эти четыре геттера игра читает и отправляет на свой сервер в отчёте
+`AppVerification` — то есть половина того, из-за чего появляется табличка про виртуальное
+пространство, закрыта. Три запуска, три приложения, ни одного падения, `/proc` ничего не
+выдаёт.
+
+### Плохое: правка для SQLite, сделанная три прогона назад, никогда не выполнялась
+
+Вторая половина (папка с данными) снова отказалась, и с тем же самым сообщением, что и в
+прогоне 14:
+
+```
+io_redirect: hooked libsqlite.so=2+abs
+W SQLiteLog: (28) file renamed while open: /data/data/…/.unique-path-probe.db
+E SQLiteLog: (1802) … disk I/O error
+```
+
+Я тогда написал, что «сохранённые адреса тоже подменяются». **Это оказалось неправдой, и
+твой лог — то, что это доказывает.** `libsqlite.so=2` — это две подменённые точки, ровно
+столько, сколько даёт обычный вызов; `+abs` означает, что подмена сохранённых адресов была
+*включена* для этой библиотеки, а не что хоть один такой адрес нашёлся. Ни одного не
+нашлось.
+
+Причина — в том, как Android собирает свои системные библиотеки: таблица, по которой я эти
+адреса искал, у них хранится в упакованном виде, и мой обход её просто не видит. Такая
+библиотека выглядит в отчёте ровно как библиотека, в которой этих адресов нет вовсе. Ни
+один прежний лог не мог это различить: «ничего не подменил» и «нечего было подменять»
+печатались одним и тем же числом.
+
+**Что сделано.** Я перестал спорить с форматом. У SQLite есть собственный официальный
+интерфейс ровно для этой задачи — замена её таблицы системных вызовов по имени, — и он
+работает независимо от того, как библиотека собрана. Чтобы до него добраться, нужен адрес
+одной функции внутри системной библиотеки, которую приложению не разрешено открывать
+обычным способом; он теперь читается напрямую из таблицы символов уже загруженной
+библиотеки. На это есть отдельный тест, который сверяет результат с ответом системы для
+того же имени.
+
+В логе это теперь видно числом: `sqlite=8` рядом со `slots=102`. Если там будет `sqlite=0`
+и база опять не откроется — значит до интерфейса не добрались, и лог скажет, почему.
+
+### Главное: почему «Попытка входа отменена» — и что с этим сделано
+
+Здесь я был неправ, и это самая полезная находка за несколько прогонов.
+
+Я всё время объяснял отказ входа тем, что Google проверяет имя пакета и подпись приложения,
+и внутри UNIQUE запрос приходит как `com.unique`. Это правда — но **не про то, что
+происходит у тебя**. Я перечитал два твоих старых лога, посмотрев не на результат, а на
+время:
+
+```
+запрос ушёл к Play services      …460.307
+ответ: «отменено»                …460.686
+```
+
+Девять попыток в двух логах: 0.38 с, 0.47 с, 0.31 с, 0.23 с, 0.25 с… **Список аккаунтов ни
+разу не был показан.** Никто ничего не выбирал и не отменял — Play services отказал в самом
+запросе и вернулся. И слова `DEVELOPER_ERROR`, которым я объяснял отказ, в логах нет вообще:
+до выдачи токена дело не доходило ни разу.
+
+Настоящая причина проще. Библиотека Google внутри игры собирает запрос так:
+
+```java
+new SignInConfiguration(context.getPackageName(), настройки)
+```
+
+Внутри UNIQUE `getPackageName()` отвечает `com.axlebolt.standoff2` — и это правильно, ради
+этого весь движок и написан. Но активность, которая этот запрос запускает, принадлежит
+`com.unique`, потому что процесс приложения — это процесс UNIQUE. Play services сравнивает
+эти два имени, они не совпадают, и он отказывает. Это ровно та проверка, ради которой она
+там и стоит.
+
+**Что сделано.** Теперь запрос перед отправкой приводится в согласие сам с собой:
+конфигурация копируется (объект самой игры не трогается), поле с именем пакета заменяется
+на `com.unique` — то есть на правду о том, кто запустил активность, — и это пишется в лог:
+
+```
+GOOGLE_SIGN_IN_RETARGETED … to=com.unique serverToken=requested
+```
+
+**Чего ждать, честно.** Это должно довести до **списка аккаунтов** — того самого экрана,
+который, по твоим словам, в других виртуалках появляется. Дальше возможны два исхода, и они
+зависят от того, что именно просит игра:
+
+- если ей нужен только аккаунт (почта, имя) — вход должен пройти;
+- если ей нужен токен для её собственного сервера — вот тут и будет та стена, про которую я
+  писал раньше, и Google ответит ошибкой. В логе заранее написано, какой из двух случаев:
+  `serverToken=requested` или `serverToken=no`.
+
+Подделывать «успех», выбросив запрос токена, я не стал: игра получила бы аккаунт без того,
+что просила, и упала бы позже и непонятнее.
+
+**Ни на одном телефоне это ещё не проверялось.** Проверить может только твой лог.
+
+### Одна мелочь про размер
+
+Файл на 0.5 МБ меньше прошлого, и это не потеря функциональности: шрифт иконок теперь
+собирается только из тех значков, которые интерфейс реально использует, как и написано в
+команде сборки. Все иконки в коде заданы статически, так что вырезать лишнее безопасно.
+Если вдруг где-то в интерфейсе UNIQUE увидишь пустой квадрат вместо значка — скажи, это
+будет от этого и лечится одним флагом.
+
+### Что посмотреть в этот раз, по порядку
+
+1. **Открой сначала два-три приложения, у которых есть данные** (файловый менеджер, что-то,
+   где ты был залогинен) — и скажи, всё ли на месте. Ошибка в подмене путей выглядит не как
+   падение, а как приложение, которое «забыло» всё.
+2. **Нажми вход через Google в Standoff 2.** Главный вопрос: **появляется ли список
+   аккаунтов?** Если да — это уже другой этап, чего бы там дальше ни случилось. Если снова
+   мгновенная отмена — значит причина другая, и лог теперь измеряет время ответа и скажет
+   это прямо.
+3. Если вход прошёл — **дождись загрузки игры** и посмотри, появляется ли табличка про
+   виртуальное пространство. Она приходит **после** входа, поэтому запуск без входа про неё
+   ничего не доказывает.
+
+## What changed one run ago
+
 Хорошая новость: возврат сработал. Никаких падений драйвера, ничего не крашится, игра
 запускается и показывает своё меню — на скриншоте это видно. Осталось два провала, и один
 из них я наконец понял.
@@ -107,7 +233,7 @@ Java всё равно не видит». Последнее — это то, ч
 Порядок от этого не меняется: сначала пути, потом вход. Но теперь ясно, что до таблички про
 виртуальное пространство мы ещё не дошли — а значит и не проверили то, ради чего всё это.
 
-## What changed one run ago
+## What changed two runs ago
 
 Прошлая сборка сделала хуже, и твой лог говорит чем — одной строкой.
 
@@ -156,7 +282,7 @@ E CRASH: signal 6 (SIGABRT) … name: RenderThread >>> com.axlebolt.standoff2 <<
 то, ради чего стоит работать, потому что в отличие от аттестации она находится в
 досягаемости.
 
-## What changed two runs ago
+## What changed three runs ago
 
 Your log was the most useful one this project has had, and not because things worked. Both
 of the safety checks I built into the last build fired, and one of them was right to.
@@ -298,7 +424,7 @@ uses the native Google API.
 3. Whether the "virtual space" notice appears in Standoff 2 — and whether the
    "not enough memory" one is gone.
 
-## What changed three runs ago
+## What changed four runs ago
 
 **Your last log was the best one yet: seventeen of eighteen checks passed.** The game
 launched, ran, did not crash, and did not die on the sign-in button the way it did before.
@@ -368,7 +494,7 @@ such thing — the only line containing that word was UNIQUE's own explanation o
 *would* happen. A tool that cannot tell its own prediction from a real answer is worse than
 no tool, because both read identically. Fixed, with a test.
 
-## What changed four runs ago
+## What changed five runs ago
 
 **I read the game.** Two passes were spent guessing at what Standoff 2 checks; this time
 the check itself was found, in the shipping build, and it is not what either of us assumed.
@@ -463,7 +589,7 @@ What was new is underneath, and it is worse than the crash:
   the protector changes its mind is a measurement, not a promise — if it still fails, it
   fails for a reason worth reading.
 
-## What changed five runs ago
+## What changed six runs ago
 
 The rewrite from the last build worked — your log shows 17 requests going out under a
 name Google accepts, and the game-files message is gone. What it uncovered is three more
@@ -490,7 +616,7 @@ covered all of them.** The `DEVELOPER_ERROR` is real for a request that reaches 
 UNIQUE. But this crash never reached Google at all. Try signing in on this build and send
 the log: what happens now is something nobody has measured, me included.
 
-## What changed six runs ago
+## What changed seven runs ago
 
 - **Google Play services actually works now.** There was one refusal behind every Google
   failure this project has ever had: Play services checks that the calling app's name
@@ -515,7 +641,7 @@ the log: what happens now is something nobody has measured, me included.
   picker reaches, several at once. It is still reachable from an app's own Storage
   section, which opens it directly inside that app.
 
-## What changed seven runs ago
+## What changed eight runs ago
 
 Six things were reported. Two of them were mistakes of mine, one was a request, and the
 log had all of them.
@@ -550,7 +676,7 @@ log had all of them.
   services resolves the caller to UNIQUE, so a token comes back for UNIQUE and not for the
   app. Only Play services running *inside* the space can answer that, and it is not built.
 
-## What changed eight runs ago
+## What changed nine runs ago
 
 That log was answered with two words — *"nothing changed"* — and a screenshot of a
 notification asking to install Google Play services. That was fair. The build was
@@ -577,7 +703,7 @@ installed and its new code was running; the code was wrong.
   passed on the log that produced that notification; this is the seventeenth, and it is
   asserted against that same log so the rule cannot come back quietly.
 
-## What changed nine runs ago
+## What changed ten runs ago
 
 Six apps launched in that run and three of them died seconds later, all of the same thing.
 This build answers everything that log reported.

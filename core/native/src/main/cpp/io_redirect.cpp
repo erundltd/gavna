@@ -529,43 +529,22 @@ std::string read_unviewed(const char* path) {
     return path == nullptr ? std::string() : read_all(path);
 }
 
-/// Which libraries the interception covers. `"*"` means every one of them.
+/// Which libraries the interception covers, as path substrings.
 ///
-/// ## Why the whole process, which was not the first answer
+/// `"*"` matches every loaded library. It is supported and **is not what UNIQUE uses**:
+/// the fifteenth phone run tried it and the Mali driver aborted the render thread when
+/// its gralloc mapper was hooked. `AppBootstrap.PLATFORM_IO_LIBRARIES` carries the list
+/// that ships, with the run behind each entry.
 ///
-/// The scope was the guest's own libraries, then those plus three of the platform's. The
-/// fourteenth phone log ended that: with the guest reporting an installed-shaped
-/// `sourceDir`, a system library nobody had thought about read it and could not open it —
+/// Two things the scope is not:
 ///
-/// ```
-/// E misc: isReadonlyFilesystem():
-///     statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk) failed:
-///     No such file or directory
-/// ```
-///
-/// — because that library was outside the scope, so its `statfs` went to the real
-/// filesystem, where no such directory exists. A path handed to a guest is handed to
-/// every library in the guest's process, and any of them may be the one that opens it.
-/// Publishing such a path and hooking only some of the process is worse than publishing
-/// nothing: the path exists for some callers and not others, and the failure surfaces as
-/// the guest's own bug.
-///
-/// ## Why that is safe, which is a property of the table
-///
-/// Every rule in `VirtualPathModel.redirectionRules` names either the *guest's* package
-/// (`/data/data/<guest>`, `/data/user/0/<guest>`, `/data/app/…<guest>…`) or a
-/// shared-storage alias (`/sdcard`, `/storage/emulated/0`, `/storage/self/primary`,
-/// `/mnt/sdcard`). None of them can match a path under `/data/user/0/com.unique`, so
-/// UNIQUE's own file operations pass through untouched no matter which library makes
-/// them — `round_trip_test.cpp` asserts exactly that, by name, against UNIQUE's own
-/// preferences, database, diagnostics and installed APK.
-///
-/// So the hook being everywhere does not mean the *redirect* is everywhere. It means the
-/// table gets asked in every library instead of three, and the table is what decides.
-///
-/// The exclusions still apply on top, and now matter more: a library left out is a
-/// library where a published path does not resolve. That cost is stated in
-/// COMPATIBILITY.md rather than discovered.
+/// - It is not the redirect. Every rule in `VirtualPathModel.redirectionRules` names the
+///   guest's package or a shared-storage alias, so none can match a path under
+///   `/data/user/0/com.unique`, and a hooked library that touches UNIQUE's own files is
+///   unaffected. `round_trip_test.cpp` asserts that by name.
+/// - It is not a safety argument on its own. That was the mistake the fifteenth run
+///   corrected: a library can be broken by being hooked at all, whatever the table then
+///   decides, and a driver is exactly such a library.
 void set_scope(const char** paths, int count) {
     std::vector<std::string> filters;
     for (int i = 0; i < count; ++i) {
@@ -657,7 +636,30 @@ InstallStatus install_locked() {
     // One memo per request set: the load watch below hooks a different symbol and must
     // not have its scan mark libraries as done for this one.
     static std::vector<std::string> seen;
-    auto report = plt::hook_all(filters, excludes, requests,
+
+    // Where an absolute data relocation is patched as well as a call.
+    //
+    // One entry, with one reason. SQLite wraps `open` in a local function, which reaches
+    // the PLT, and stores `stat`, `lstat`, `access`, `unlink`, `mkdir`, `rmdir` and
+    // `readlink` *by address* in a static table the linker fills in at load:
+    //
+    //     { "open",  (sqlite3_syscall_ptr)posixOpen, 0 },   /* a call     */
+    //     { "stat",  (sqlite3_syscall_ptr)stat,      0 },   /* a pointer  */
+    //
+    // so a hook that patches only calls redirects half of one library's file operations.
+    // The fourteenth run is that half: SQLite opened the probe database in the instance,
+    // looked for it at the path it was given, and reported `file renamed while open`.
+    //
+    // The first attempt at this patched absolute slots everywhere, and the fifteenth run
+    // is what that costs: `mali_config_interface_mapper: Failed to acquire IMapper
+    // service. Aborting.` and a SIGABRT on the render thread. A PLT slot is by
+    // construction a call into an imported function. An absolute slot is a pointer in a
+    // library's own data, and a symbol-name match is a much weaker warrant for
+    // overwriting one. So this list stays one library long until another one earns a
+    // place on it.
+    static const std::vector<std::string> abs64{"libsqlite.so"};
+
+    auto report = plt::hook_all(filters, excludes, abs64, requests,
                                 sizeof(requests) / sizeof(requests[0]), seen);
     g_slots_patched += report.slots_patched;
     for (const auto& failure : report.failures) {
@@ -756,8 +758,8 @@ InstallStatus watch_library_loads() {
     // protector from the *watch* would mean a library it loads is never redirected at
     // all, which is a different and larger loss than not redirecting the protector.
     static std::vector<std::string> seen;
-    static const std::vector<std::string> no_excludes;
-    auto report = plt::hook_all(scope, no_excludes, requests,
+    static const std::vector<std::string> none;
+    auto report = plt::hook_all(scope, none, none, requests,
                                 sizeof(requests) / sizeof(requests[0]), seen);
     g_watching = report.slots_patched > 0;
     ULOGI("io_redirect: library-load watch %s (%d slot(s) in %d libraries)",

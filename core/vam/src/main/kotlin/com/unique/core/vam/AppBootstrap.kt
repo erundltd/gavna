@@ -1039,17 +1039,17 @@ object AppBootstrap {
     }
 
     /**
-     * Every library in the guest's process, minus the exclusions.
+     * The platform libraries whose file operations are redirected, named one by one.
      *
-     * ## Three scopes, and why only the third can work
+     * ## Four scopes, and what each run cost
      *
-     * It was the guest's own `.so` files, which is the right scope for a guest's *native*
-     * code and covers none of its Java. It was then those plus `libjavacore.so`,
-     * `libsqlite.so` and `libandroid_runtime.so`, which covers a guest's Java file IO —
-     * `File`, every stream, every `SharedPreferences` write, every database.
+     * It was the guest's own `.so` files — right for a guest's *native* code, and covering
+     * none of its Java. It was then those plus `libjavacore.so`, `libsqlite.so` and
+     * `libandroid_runtime.so`, which covers `File`, every stream, every preference write
+     * and every database.
      *
-     * The fourteenth phone run ended both. With the guest reporting an installed-shaped
-     * `sourceDir`, a system library nobody had listed read it:
+     * **The fourteenth run showed that was not enough.** With the guest reporting an
+     * installed-shaped `sourceDir`, a system library nobody had listed read it:
      *
      * ```
      * E misc: isReadonlyFilesystem():
@@ -1057,13 +1057,31 @@ object AppBootstrap {
      *     No such file or directory
      * ```
      *
-     * A path handed to a guest is handed to **every library in the guest's process**, and
-     * any of them may be the one that opens it. Publishing such a path while hooking part
-     * of the process is worse than publishing nothing: the path works for some callers and
-     * not others, and the failure arrives as the guest's own bug — which is exactly how it
-     * arrived, as a game reporting that the device was out of space.
+     * **The fifteenth run showed that "then hook everything" is not the answer either.**
+     * With the whole process in scope — 436 slots in 385 libraries — the graphics stack
+     * died:
      *
-     * ## Why the wide scope is safe, which is a property of the table
+     * ```
+     * io_redirect: hooked 9 new slot(s) after loading mapper.mediatek.so
+     * E mali_config_interface_c_mapper: Failed to locate stable-C mapper library
+     * E mali_config_interface_mapper: Failed to acquire IMapper service. Aborting.
+     * E CRASH: signal 6 (SIGABRT) … name: RenderThread >>> com.axlebolt.standoff2 <<<
+     * ```
+     *
+     * A vendor gralloc mapper is not an ordinary consumer of a path. It is a driver, it is
+     * loaded into the render thread, and it aborts rather than degrades. Nothing UNIQUE
+     * wants from a redirect is worth being inside it.
+     *
+     * ## So: named, and derived from what a phone actually reported
+     *
+     * The list below is not a guess. The fifteenth run printed, per library, how many
+     * slots each one had for these symbols — the diagnostic added for exactly this — and
+     * this is that list with the graphics and vendor libraries taken back out. Anything
+     * not here is not hooked, and a published path that some caller cannot open shows up
+     * in the analyzer's `paths` check naming the caller, which is how the next name gets
+     * added.
+     *
+     * ## Why redirecting inside a platform library is safe at all
      *
      * A hook that redirects is only as dangerous as the table it applies. Every rule in
      * `VirtualPathModel.redirectionRules` names either the **guest's** package
@@ -1071,16 +1089,37 @@ object AppBootstrap {
      * public APK directory) or a shared-storage alias (`/sdcard`, `/storage/emulated/0`,
      * `/storage/self/primary`, `/mnt/sdcard`). **None can match a path under
      * `/data/user/0/com.unique`**, so UNIQUE's own file operations pass through untouched
-     * no matter which library makes them — asserted by name in `round_trip_test.cpp`
-     * against UNIQUE's own preferences, database, diagnostics and installed APK.
+     * no matter which library makes them — asserted by name in `round_trip_test.cpp`.
      *
-     * So the hook being everywhere is not the redirect being everywhere. It is the table
-     * being asked in every library instead of three, and the table is what decides.
-     *
-     * The linker, `libc.so`, `libdl.so`, `libm.so` and UNIQUE's own native library are
-     * excluded — see `GuestNativeExclusions` for why each, and why nothing is lost by it.
+     * That argument is about the *table*. What the fifteenth run added is that it is not
+     * the whole argument: a library can be broken by being hooked at all, whatever the
+     * table then decides.
      */
-    private val REDIRECT_SCOPE = listOf("*")
+    private val PLATFORM_IO_LIBRARIES = listOf(
+        // Java file IO: `File`, every stream, every `SharedPreferences` write.
+        "libjavacore.so",
+        // A database, opened by absolute path. Also the one library where absolute data
+        // relocations are patched — see `io_redirect.cpp`.
+        "libsqlite.so",
+        "libandroid_runtime.so",
+        // Assets, resources and split APKs — `AssetManager.addAssetPath` lands here.
+        "libandroidfw.so",
+        // `android::base` and libcutils: the file helpers half the platform calls,
+        // including the readonly-filesystem check the fourteenth run failed on.
+        "libbase.so",
+        "libcutils.so",
+        "libutils.so",
+        // `System.loadLibrary` and the classloader namespaces, which open the guest's
+        // own `.so` files by path.
+        "libnativeloader.so",
+        // Installed-APK plumbing: incremental delivery and the data loader both take
+        // `/data/app/…` paths and are exactly what a published `sourceDir` reaches.
+        "libincfs.so",
+        "libdataloader.so",
+        // Binder and zip: parcelled paths and APK reads.
+        "libbinder.so",
+        "libz.so",
+    )
 
     /** What [armIoRedirection] published, so [installIoRedirection] can report it. */
     private data class Armed(
@@ -1134,7 +1173,10 @@ object AppBootstrap {
                     abiDirName = appInfo.nativeLibraryDir?.substringAfterLast('/') ?: "arm64-v8a",
                 )
             }.getOrDefault(emptyList())
-            val scope = REDIRECT_SCOPE
+            val scope = listOfNotNull(
+                appInfo.nativeLibraryDir,
+                appInfo.sourceDir?.substringBeforeLast('/'),
+            ).filter { it.isNotBlank() }.flatMap(::pathAliases).distinct() + PLATFORM_IO_LIBRARIES
             UniqueNative.setRedirectScope(scope)
             // Set before install, never after: install() walks what is loaded now, and an
             // exclusion that arrives afterwards excludes a library that is already hooked.
@@ -1384,6 +1426,24 @@ object AppBootstrap {
             ),
         )
         return candidate
+    }
+
+    /**
+     * The same directory under every name the platform might report it as.
+     *
+     * `/data/data/<host>` and `/data/user/0/<host>` are the same directory: the first is a
+     * symlink kept for compatibility, and which one appears depends on who resolved the
+     * path. `Context.getFilesDir()` hands back the `/data/user/0` form, while the dynamic
+     * linker recorded the library it opened as `/data/data/…` — so a scope built from the
+     * first never matched the second and nothing was hooked, with the library plainly
+     * loaded and the filter plainly correct-looking.
+     */
+    private fun pathAliases(path: String): List<String> = when {
+        path.startsWith("/data/user/0/") ->
+            listOf(path, path.replaceFirst("/data/user/0/", "/data/data/"))
+        path.startsWith("/data/data/") ->
+            listOf(path, path.replaceFirst("/data/data/", "/data/user/0/"))
+        else -> listOf(path)
     }
 
     /**

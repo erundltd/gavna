@@ -47,7 +47,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**290 JVM tests, 15 Dart tests, 94 native checks, 114 off-device tool tests — all passing.**
+**290 JVM tests, 15 Dart tests, 94 native checks, 119 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1351,6 +1351,63 @@ looks like an app that is empty rather than one that crashes. The new
 `io_redirect: hooked <lib>=<n>` lines say which libraries the redirect actually reached, and
 `io_redirect: nothing in this process imports: …` names any symbol in the table that nothing
 spells that way. Either line would have named this run's bug on sight.
+
+### The fifteenth run: hooking everything is not the answer either
+
+The fourteenth run said three libraries was too narrow — a system library outside the scope
+could not `statfs` the published APK path, and the game told its player the device was out
+of space. The answer tried here was the whole process. This log is what that costs:
+
+```
+io_redirect installed: 436 slot(s) in 385/389 libraries, scope=*
+io_redirect: hooked 9 new slot(s) after loading mapper.mediatek.so
+E mali_config_interface_c_mapper: Failed to locate stable-C mapper library
+E mali_config_interface_mapper: Failed to acquire IMapper service. Aborting.
+E CRASH: signal 6 (SIGABRT) … name: RenderThread >>> com.axlebolt.standoff2 <<<
+```
+
+A vendor gralloc mapper is not an ordinary consumer of a path. It is a driver, it runs on
+the render thread, and it aborts where ordinary code returns an error. The table argument —
+no rule in `redirectionRules` can match `/data/user/0/com.unique`, so a hooked library
+touching UNIQUE's own files is unaffected — was never wrong, and was never the whole
+argument. **A library can be broken by being hooked at all, whatever the table then
+decides.** That sentence is the finding.
+
+Two more things came with it, and the third is the reason this run reads worse than the one
+before rather than better:
+
+- The published APK path stopped resolving, so the code gate refused:
+  `GUEST_PATHS_PUBLISHED code=false slots=436 … the published APK path does not open`.
+  The fourteenth run, with a *narrower* hook, published it. A wider hook redirecting less
+  is not something reasoning predicts, and it is not yet explained; the per-library
+  diagnostic added for it is capped and did not name `libjavacore.so` either way.
+- `androidx.datastore` threw `Unable to create parent directories of
+  /data/user/0/com.axlebolt.standoff2/files/datastore/…` on a Firebase background thread,
+  twice. The game restarted three times in a 60-second run.
+
+**So the scope goes back to a named list, and this time it is derived from a measurement
+rather than from a guess about which libraries matter.** The fifteenth run printed, per
+library, how many slots each had for these symbols — the diagnostic added after the
+fourteenth — and the shipped list is that output with the graphics and vendor libraries
+taken back out: `libjavacore.so`, `libsqlite.so`, `libandroid_runtime.so`,
+`libandroidfw.so`, `libbase.so`, `libcutils.so`, `libutils.so`, `libnativeloader.so`,
+`libincfs.so`, `libdataloader.so`, `libbinder.so`, `libz.so`. `/vendor/`, `/odm/` and
+`/system/vendor/` are excluded outright so that widening the scope by accident cannot reach
+a driver again.
+
+**Absolute data relocations are narrowed the same way, and for the same reason.** Patching
+them is what the fourteenth run's SQLite failure needed — SQLite stores `stat` and `lstat`
+by address in a static table and reaches `open` through the PLT, so a call-only hook
+redirects half of one library. The first attempt patched them process-wide. A PLT slot is
+by construction a call into an imported function; an absolute slot is a pointer in a
+library's own data, and a symbol-name match is a much weaker warrant for overwriting one.
+They are now patched in `libsqlite.so` and nowhere else, and the per-library diagnostic
+marks which libraries got them.
+
+**What this run does not settle, stated so it is not counted as progress.** The
+`code=false` cause is unexplained. If the next run still refuses, the per-library line —
+now uncapped enough to list everything, and marked with which relocation kinds were used —
+says whether `libjavacore.so` got its `stat` patched, and that is the next thing to read.
 
 ### What the thirteenth run settled about signing in, found late
 

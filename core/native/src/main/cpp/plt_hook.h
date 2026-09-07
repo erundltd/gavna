@@ -78,8 +78,14 @@ struct HookReport {
 // one memo would have the first one's scan mark libraries as done for the second, which
 // would then patch nothing in them and never say so. Pass an empty vector to walk
 // everything.
+// `abs64_libraries` names the libraries in which *absolute data* relocations are patched
+// as well as PLT and GOT ones. It is a separate, much shorter list on purpose: an ABS64
+// slot is a pointer stored in a library's own data, and patching those across a whole
+// process is how the fifteenth phone run ended with the Mali driver aborting. Only a
+// library whose design is known to need it belongs here — see io_redirect.cpp.
 HookReport hook_all(const std::vector<std::string>& path_filters,
                     const std::vector<std::string>& path_excludes,
+                    const std::vector<std::string>& abs64_libraries,
                     HookRequest* requests, size_t request_count,
                     std::vector<std::string>& seen);
 

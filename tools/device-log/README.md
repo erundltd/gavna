@@ -205,14 +205,14 @@ only affects the header line.
 tools/device-log/self_test.py
 ```
 
-97 tests, under a second, no dependencies. Three kinds:
+102 tests, under a second, no dependencies. Three kinds:
 
 - **`fixtures/redmi-android15.log`** — a real run on a Redmi Note 12, Android 15, ARM64:
   the run in which no app launched. Every finding asserted against it is something that
   happened to a real phone, so a check that stops reporting one has regressed. It is the
   full run filtered to the lines that carry evidence (941 of 26,950); the verdicts are
   identical to those from the unfiltered log.
-- **`fixtures/redmi-android15-run4.log` … `-run14.log`** — the runs after it,
+- **`fixtures/redmi-android15-run4.log` … `-run15.log`** — the runs after it,
   each filtered the same way. Every fault a run found has an assertion here, so a check
   that stops reporting one is a regression in the tool rather than progress in the
   engine. The sixth is the run in which six of seven apps launched and the games could
@@ -245,7 +245,11 @@ tools/device-log/self_test.py
   paths in it, and it is kept because it contains both halves of what that cost: the data
   gate refusing with SQLite's own diagnosis attached, and a published code path that a
   system library outside the hook's scope could not open. The `paths` check is written
-  against it.
+  against it. The fifteenth is the answer to the fourteenth and it is a negative one: with
+  the whole process hooked, the Mali driver could not find its gralloc mapper and aborted
+  the render thread. It is kept because any later scope change has to be measured against
+  all three of what it broke — the native abort, the code gate refusing, and datastore
+  failing on the guest's own data path.
 - **A synthetic healthy run** — every check must pass on it. Without that the suite would
   prove only that the tool says FAIL, which a tool that always says FAIL would also
   pass.

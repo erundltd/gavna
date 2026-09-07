@@ -64,6 +64,55 @@ install over them.
 
 ## What changed since the last phone run
 
+Прошлая сборка сделала хуже, и твой лог говорит чем — одной строкой.
+
+```
+io_redirect: hooked 9 new slot(s) after loading mapper.mediatek.so
+E mali_config_interface_c_mapper: Failed to locate stable-C mapper library
+E mali_config_interface_mapper: Failed to acquire IMapper service. Aborting.
+E CRASH: signal 6 (SIGABRT) … name: RenderThread >>> com.axlebolt.standoff2 <<<
+```
+
+Я расширил перехват на **весь процесс** — 436 точек в 385 библиотеках — чтобы закрыть
+дыру из предыдущего лога. В числе этих 385 оказался драйвер графики Mali. Он не нашёл свой
+модуль памяти и **аварийно завершил поток отрисовки**. Игра перезапускалась три раза за
+минуту.
+
+Мой довод «это безопасно, потому что правила подмены не могут совпасть с папками UNIQUE»
+был верен и остаётся верным — но он был не про то. **Библиотеку можно сломать самим фактом
+перехвата, независимо от того, что потом решат правила.** Драйвер — ровно такая библиотека:
+он не возвращает ошибку, он падает.
+
+**Что теперь.** Список библиотек снова именной, но составлен не на глаз: прошлая сборка
+впервые напечатала, сколько точек в каждой библиотеке, и я взял этот список, убрав из него
+графику и вендорское. Плюс `/vendor/`, `/odm/`, `/system/vendor/` исключены наглухо, чтобы
+случайное расширение больше не дотянулось до драйвера.
+
+То же самое с той тонкостью, из-за которой не открывалась база SQLite: она нужна ровно
+одной библиотеке (`libsqlite.so`), а применялась ко всем — теперь только к ней.
+
+**Чего эта сборка не объясняет, и я не буду делать вид, что объясняет.** В прошлом логе
+опубликованный путь к APK перестал открываться (`code=false`), хотя в позапрошлом, с
+*более узким* перехватом, он открывался. Более широкий перехват, подменяющий *меньше*, —
+это не то, что предсказывает рассуждение, и причину я пока не знаю. Диагностика для этого
+уже стоит и в следующем логе напечатает по каждой библиотеке, что именно в ней подменено.
+
+### Про вход — ты прав, и я был неправ дважды
+
+Ты сказал: вход и есть та стена, потому что войти в игру просто не получается. Это верно, и
+мои две поправки до этого были неточны. Как я теперь понимаю картину с твоих слов:
+
+- выбираешь любой вход → игра грузится → пишет, что запущена в виртуальном пространстве;
+- так во **всех** виртуалках, не только в нашей.
+
+Значит вход доходит до сервера, и отказ приходит **от сервера игры**, а не от Google. Это
+ровно то, что предсказывает разбор бинарника: отчёт `AppVerification` с путём к APK едет
+*внутри* запроса на вход. Никто ещё эту стену не прошёл — и это же значит, что она и есть
+то, ради чего стоит работать, потому что в отличие от аттестации она находится в
+досягаемости.
+
+## What changed one run ago
+
 Your log was the most useful one this project has had, and not because things worked. Both
 of the safety checks I built into the last build fired, and one of them was right to.
 
@@ -204,7 +253,7 @@ uses the native Google API.
 3. Whether the "virtual space" notice appears in Standoff 2 — and whether the
    "not enough memory" one is gone.
 
-## What changed one run ago
+## What changed two runs ago
 
 **Your last log was the best one yet: seventeen of eighteen checks passed.** The game
 launched, ran, did not crash, and did not die on the sign-in button the way it did before.
@@ -274,7 +323,7 @@ such thing — the only line containing that word was UNIQUE's own explanation o
 *would* happen. A tool that cannot tell its own prediction from a real answer is worse than
 no tool, because both read identically. Fixed, with a test.
 
-## What changed two runs ago
+## What changed three runs ago
 
 **I read the game.** Two passes were spent guessing at what Standoff 2 checks; this time
 the check itself was found, in the shipping build, and it is not what either of us assumed.
@@ -369,7 +418,7 @@ What was new is underneath, and it is worse than the crash:
   the protector changes its mind is a measurement, not a promise — if it still fails, it
   fails for a reason worth reading.
 
-## What changed three runs ago
+## What changed four runs ago
 
 The rewrite from the last build worked — your log shows 17 requests going out under a
 name Google accepts, and the game-files message is gone. What it uncovered is three more
@@ -396,7 +445,7 @@ covered all of them.** The `DEVELOPER_ERROR` is real for a request that reaches 
 UNIQUE. But this crash never reached Google at all. Try signing in on this build and send
 the log: what happens now is something nobody has measured, me included.
 
-## What changed four runs ago
+## What changed five runs ago
 
 - **Google Play services actually works now.** There was one refusal behind every Google
   failure this project has ever had: Play services checks that the calling app's name
@@ -421,7 +470,7 @@ the log: what happens now is something nobody has measured, me included.
   picker reaches, several at once. It is still reachable from an app's own Storage
   section, which opens it directly inside that app.
 
-## What changed five runs ago
+## What changed six runs ago
 
 Six things were reported. Two of them were mistakes of mine, one was a request, and the
 log had all of them.
@@ -456,7 +505,7 @@ log had all of them.
   services resolves the caller to UNIQUE, so a token comes back for UNIQUE and not for the
   app. Only Play services running *inside* the space can answer that, and it is not built.
 
-## What changed six runs ago
+## What changed seven runs ago
 
 That log was answered with two words — *"nothing changed"* — and a screenshot of a
 notification asking to install Google Play services. That was fair. The build was
@@ -483,7 +532,7 @@ installed and its new code was running; the code was wrong.
   passed on the log that produced that notification; this is the seventeenth, and it is
   asserted against that same log so the rule cannot come back quietly.
 
-## What changed seven runs ago
+## What changed eight runs ago
 
 Six apps launched in that run and three of them died seconds later, all of the same thing.
 This build answers everything that log reported.
@@ -634,20 +683,20 @@ answer it. Everything else — hardware Vulkan, WebView rendering, Play Integrit
 Billing, Play Games — is still `NOT_TESTED` or `UNSUPPORTED` and stays that way until a run
 says otherwise.
 
-This build carries the widest change the engine has ever had — file access in *every*
-library of every app goes through it — and no phone has run it yet. The previous build's
-narrower version of the same change broke something visible, which is stated above rather
-than left in a footnote.
+The previous build carried the widest change the engine has ever had — file access in every
+library of every app — and it broke the graphics driver on this phone. This build takes that
+back out and replaces it with a named list. Whether the list is the right length is the open
+question, and the last build's own diagnostics are what will answer it.
 
 What would help most from the next log, in order:
 
-1. **Whether apps you already had still have their data.** Open two or three with something
-   saved in them, before the game. This build redirects file access in *every* library of
-   every app; a mistake there does not crash, the app just looks empty.
-2. **`GUEST_PATHS_PUBLISHED … code=true data=true`**, and no `paths` failure.
-3. **Whether the "virtual space" notice still appears in the game**, and whether the
-   "not enough memory" one is gone.
-4. **`PROC_VIEW_INSTALLED … leaked=0`**, still — the check now reads around its own cover
-   rather than through it, so it can still fail, which is the point of it.
-5. **`GMS_PACKAGE_NOT_REWRITTEN`**, if it appears — that line names the last Google route
-   that is still refused, precisely enough to fix without guessing.
+1. **Whether the game stops crashing on the render thread.** That is what the last build
+   broke and what this one takes back out.
+2. **`GUEST_PATHS_PUBLISHED … code=true`**, and no `paths` failure. `data=false` is still
+   the expected state and is not a fault.
+3. **`io_redirect: hooked <library>=<n>`** — one line per library. If the path still does
+   not open, that list is what says which library is missing its redirect.
+4. **Whether apps you already had still have their data.** Open two or three with something
+   saved in them before the game.
+5. **Whether the "virtual space" notice still appears**, and whether "not enough memory"
+   is gone.

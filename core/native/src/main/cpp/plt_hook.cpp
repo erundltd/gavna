@@ -65,9 +65,16 @@ constexpr unsigned kAbs64 = R_X86_64_64;
 ///
 /// The addend has to be zero. `S + A` with a non-zero addend is a pointer *into* the
 /// function, not to it, and replacing that would be replacing something else entirely.
-bool is_address_slot(unsigned type, ElfW(Sxword) addend) {
+///
+/// **And it is done in named libraries only.** The first build to patch these did it
+/// everywhere, and the fifteenth phone run is what that costs: the Mali driver failed to
+/// locate its gralloc mapper and aborted the render thread. A PLT slot is by construction
+/// a call to an imported function; an absolute slot is a pointer sitting in a library's
+/// own data, and a name match is a weaker warrant for overwriting one of those than it is
+/// for a call. So the list is short and each entry has a reason.
+bool is_address_slot(unsigned type, ElfW(Sxword) addend, bool absolute_allowed) {
     if (type == kJumpSlot || type == kGlobDat) return true;
-    return type == kAbs64 && addend == 0;
+    return absolute_allowed && type == kAbs64 && addend == 0;
 }
 
 std::mutex g_mutex;
@@ -148,12 +155,15 @@ bool write_slot(void** slot, void* value, void** previous) {
 struct ScanContext {
     const std::vector<std::string>* filters;
     const std::vector<std::string>* excludes;
+    const std::vector<std::string>* abs64_libraries;
     HookRequest* requests;
     size_t request_count;
     HookReport* report;
     std::vector<std::string>* seen;
     /// Slots patched in the library currently being walked.
     int here = 0;
+    /// Whether absolute data relocations are patched in the library being walked.
+    bool absolute_here = false;
 };
 
 bool path_matches(const char* path, const std::vector<std::string>& filters) {
@@ -204,7 +214,7 @@ void patch_relocations(const Rela* rela, size_t count, const DynamicInfo& info,
 
     for (size_t i = 0; i < count; ++i) {
         const unsigned type = UNIQUE_R_TYPE(rela[i].r_info);
-        if (!is_address_slot(type, rela[i].r_addend)) continue;
+        if (!is_address_slot(type, rela[i].r_addend, ctx->absolute_here)) continue;
 
         const auto sym_index = UNIQUE_R_SYM(rela[i].r_info);
         const char* name = info.strtab + info.symtab[sym_index].st_name;
@@ -284,6 +294,8 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
     ctx->seen->push_back(key);
 
     ctx->here = 0;
+    ctx->absolute_here = path_matches(info->dlpi_name, *ctx->abs64_libraries) &&
+                         !ctx->abs64_libraries->empty();
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         const ElfW(Phdr)& phdr = info->dlpi_phdr[i];
         if (phdr.p_type != PT_DYNAMIC) continue;
@@ -294,12 +306,12 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
         patch_relocations(dynamic.rela, dynamic.rela_count, dynamic,
                           info->dlpi_addr, ctx);
     }
-    if (ctx->here > 0 && ctx->report->per_library.size() < 24) {
+    if (ctx->here > 0 && ctx->report->per_library.size() < 64) {
         const char* name = info->dlpi_name;
         const char* base = (name == nullptr) ? "" : strrchr(name, '/');
         ctx->report->per_library.emplace_back(
                 std::string(base != nullptr ? base + 1 : (name == nullptr ? "?" : name)) +
-                "=" + std::to_string(ctx->here));
+                "=" + std::to_string(ctx->here) + (ctx->absolute_here ? "+abs" : ""));
     }
     return 0;
 }
@@ -308,11 +320,14 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
 
 HookReport hook_all(const std::vector<std::string>& path_filters,
                     const std::vector<std::string>& path_excludes,
+                    const std::vector<std::string>& abs64_libraries,
                     HookRequest* requests, size_t request_count,
                     std::vector<std::string>& seen) {
     std::lock_guard<std::mutex> lock(g_mutex);
     HookReport report;
-    ScanContext ctx{&path_filters, &path_excludes, requests, request_count, &report, &seen};
+    ScanContext ctx{&path_filters,     &path_excludes, &abs64_libraries,
+                    requests,          request_count,  &report,
+                    &seen};
     dl_iterate_phdr(scan_one, &ctx);
     return report;
 }

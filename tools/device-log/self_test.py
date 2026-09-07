@@ -54,6 +54,8 @@ FIXTURE13 = os.path.join(HERE, "fixtures", "redmi-android15-run13.log")
 FIXTURE13_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run13.device.txt")
 FIXTURE14 = os.path.join(HERE, "fixtures", "redmi-android15-run14.log")
 FIXTURE14_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run14.device.txt")
+FIXTURE15 = os.path.join(HERE, "fixtures", "redmi-android15-run15.log")
+FIXTURE15_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run15.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -935,6 +937,69 @@ class RedmiRun14Test(unittest.TestCase):
 
     def test_unique_s_own_forecast_is_still_not_reported_as_google_s_answer(self):
         self.assertIn("never answered DEVELOPER_ERROR", notes(self.checks["google"]))
+
+
+class RedmiRun15Test(unittest.TestCase):
+    """The fifteenth run: hooking the whole process is not the answer either.
+
+    The fourteenth run said a scope of three libraries was too narrow — a system library
+    outside it could not `statfs` the published APK path. The answer tried here was the
+    whole process, and this log is what that costs.
+
+    ```
+    io_redirect installed: 436 slot(s) in 385 libraries
+    io_redirect: hooked 9 new slot(s) after loading mapper.mediatek.so
+    E mali_config_interface_c_mapper: Failed to locate stable-C mapper library
+    E mali_config_interface_mapper: Failed to acquire IMapper service. Aborting.
+    E CRASH: signal 6 (SIGABRT) … name: RenderThread >>> com.axlebolt.standoff2 <<<
+    ```
+
+    A vendor gralloc mapper is not an ordinary consumer of a path. It is a driver, it runs
+    on the render thread, and it aborts where ordinary code returns an error. The table
+    argument — no rule can match UNIQUE's own paths — was never wrong and was never the
+    whole argument: a library can be broken by being hooked at all.
+
+    Two more things went with it, and both are asserted here because a later scope change
+    has to be measured against all three:
+
+    - The published APK path stopped resolving, so the code gate refused
+      (`code=false … the published APK path does not open`). Where the fourteenth run had
+      published it, this one could not — a wider hook redirecting *less* is the shape of
+      the finding.
+    - `androidx.datastore` threw `Unable to create parent directories` under the guest's
+      public data path, on a Firebase background thread, twice.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE15, FIXTURE15_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_the_native_crash_names_the_libraries_that_were_loading(self):
+        detail = findings(self.checks["native"])
+        self.assertIn("mapper.mediatek.so", detail)
+        self.assertIn("died on a native signal", detail)
+
+    def test_the_excluded_libraries_are_named_rather_than_silent(self):
+        # "not hooked on purpose" and "the scan never found it" produce the same zero.
+        text = notes(self.checks["native"])
+        for name in ("linker64", "libc.so", "libunique_native.so"):
+            self.assertIn(name, text)
+
+    def test_the_code_gate_refused_and_said_why(self):
+        # The gate added after run 14. It is the thing that stopped an unusable path being
+        # handed to the guest a second time, so it must keep failing loudly here.
+        detail = findings(self.checks["paths"])
+        self.assertIn("no installed-shaped paths were published", detail)
+        self.assertIn("the published APK path does not open", detail)
+
+    def test_the_guest_crashed_on_its_own_data_path(self):
+        detail = findings(self.checks["crash"])
+        self.assertIn("Unable to create parent directories", detail)
+
+    def test_the_run_fails_on_four_checks(self):
+        failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
+        self.assertEqual(failing, ["crash", "google", "native", "paths"])
 
 
 HEALTHY = """\

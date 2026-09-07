@@ -100,6 +100,23 @@ object GuestNativeExclusions {
         "/libc.so",
         "/libdl.so",
         "/libm.so",
+
+        // Vendor and driver code, which is never in scope and is excluded anyway so that
+        // widening the scope by accident cannot reach it.
+        //
+        // The fifteenth phone run is the entry's evidence. With the whole process hooked,
+        // the Mali driver could not find its gralloc mapper and did not degrade:
+        //
+        //     io_redirect: hooked 9 new slot(s) after loading mapper.mediatek.so
+        //     E mali_config_interface_mapper: Failed to acquire IMapper service. Aborting.
+        //     E CRASH: signal 6 (SIGABRT) … name: RenderThread
+        //
+        // A driver loaded into the render thread aborts where ordinary code returns an
+        // error, so the cost of being wrong about it is the whole app rather than one
+        // file operation. Nothing UNIQUE wants from a redirect lives behind one.
+        "/vendor/",
+        "/odm/",
+        "/system/vendor/",
     )
 
     /**

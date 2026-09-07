@@ -60,7 +60,7 @@ exist because a claim was made without evidence and a later phone log contradict
 - `/proc/self/maps` inside a guest no longer names UNIQUE — `PROC_VIEW_INSTALLED …
   named=16 leaked=0` on the phone, and the graft checks its own work.
 - Two instances of one app have separate identities, storage and `ANDROID_ID`.
-- 300 JVM tests, 104 host-side native checks, 118 device-log tests, 17 APK-survey tests, 15
+- 302 JVM tests, 104 host-side native checks, 118 device-log tests, 17 APK-survey tests, 15
   Dart tests. All passing.
 
 ### Does not work
@@ -89,7 +89,7 @@ The NDK is installed by Gradle on first native build. AGP 8.13.0, Kotlin 2.2.20.
 ### Commands
 
 ```bash
-./gradlew test                    # 300 JVM tests
+./gradlew test                    # 302 JVM tests
 ./tools/native-test/run.sh        # 104 host-side native checks, no device
 (cd ui && flutter test)           # 15 Dart tests
 ./tools/device-log/self_test.py   # 118 tests for the log analyzer, no toolchain

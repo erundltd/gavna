@@ -36,7 +36,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | The two path tables are inverses (C++) | 27 checks | Every path a guest is handed round-trips; no rule can match UNIQUE's own files |
 | The relocation a GOT hook must patch | 2 checks | Taking the address of a libc function compiles to an absolute, zero-addend data relocation — the case SQLite uses. The seventeenth run showed the patch never reaching it on a platform library; see `sqlite_vfs.h` |
 | Finding a symbol in a library that cannot be `dlopen`ed (C++) | 10 checks | Against a real linker's output and against `dlsym`'s answer for the same name — the walk that reaches SQLite's own VFS interface |
-| The Google sign-in handoff | 10 | Which field is rewritten and which is left alone, that a static field is never one, and that a request for a server token is reported before Google answers |
+| The Google sign-in handoff | 12 | Which field is rewritten and which is left alone, that a static field is never one, that an inherited one is still found, that the configuration is recognised by type rather than by the key it arrives under, and that a request for a server token is reported before Google answers |
 | Signature-agnostic shim engine | 12 | Includes one shim bound to two different signatures, and conditional `proceed()` |
 | Settings screens a guest opens about itself | 6 | Which half of the intent names the app, and every case that must be left alone |
 | Device profile model | 9 | Shape, stability, regeneration, RFC 4122 |
@@ -53,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**300 JVM tests, 15 Dart tests, 104 native checks, 135 off-device tool tests — all passing.**
+**302 JVM tests, 15 Dart tests, 104 native checks, 135 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 

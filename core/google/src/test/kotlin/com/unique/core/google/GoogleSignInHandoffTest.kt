@@ -78,6 +78,27 @@ class GoogleSignInHandoffTest {
     }
 
     @Test
+    fun `an inherited field naming the guest is found too`() {
+        // `declaredFields` alone would miss it. The configuration's fields are its own
+        // today; a walk that assumes that would fail silently if it ever stopped being so.
+        val subject = InheritingConfiguration(guest)
+        assertThat(GoogleSignInHandoff.rewriteConsumer(subject, guest, host)).isEqualTo(1)
+        assertThat(subject.consumer).isEqualTo(host)
+    }
+
+    @Test
+    fun `the configuration is recognised by type, not only by the extra it arrives under`() {
+        assertThat(GoogleSignInHandoff.looksLikeConfiguration(
+            "com.google.android.gms.auth.api.signin.internal.SignInConfiguration")).isTrue()
+        assertThat(GoogleSignInHandoff.looksLikeConfiguration(null)).isFalse()
+        assertThat(GoogleSignInHandoff.looksLikeConfiguration(
+            "com.google.android.gms.auth.api.signin.GoogleSignInOptions")).isFalse()
+        // A package that merely ends with the word is not the class.
+        assertThat(GoogleSignInHandoff.looksLikeConfiguration("SignInConfiguration.Holder"))
+            .isFalse()
+    }
+
+    @Test
     fun `a request for a server token is reported`() {
         val subject = config(serverClientId = "123456-abc.apps.googleusercontent.com")
         assertThat(GoogleSignInHandoff.requestsServerToken(subject)).isTrue()
@@ -94,6 +115,10 @@ class GoogleSignInHandoffTest {
         // critical path. A non-Google object is not descended into at all.
         assertThat(GoogleSignInHandoff.requestsServerToken(NotGoogles())).isFalse()
     }
+
+    private open class HasConsumer(@JvmField val consumer: String)
+
+    private class InheritingConfiguration(consumer: String) : HasConsumer(consumer)
 
     private class NotGoogles {
         @Suppress("unused")

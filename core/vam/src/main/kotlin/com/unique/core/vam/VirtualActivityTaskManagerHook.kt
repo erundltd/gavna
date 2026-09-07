@@ -201,7 +201,7 @@ object VirtualActivityTaskManagerHook {
             holder.putParcelable(GoogleSignInHandoff.CONFIG_KEY, copy)
             out.putExtra(GoogleSignInHandoff.CONFIG_KEY, holder)
         } else {
-            out.putExtra(GoogleSignInHandoff.CONFIG_KEY, copy)
+            out.putExtra(located.key, copy)
         }
         Diagnostics.info(
             DiagChannel.LAUNCH, "GOOGLE_SIGN_IN_RETARGETED",
@@ -230,8 +230,12 @@ object VirtualActivityTaskManagerHook {
         )
     }
 
-    /** The configuration object and the bundle it was in, if it was in one. */
-    private class SignInConfig(val config: Parcelable, val bundle: Bundle?)
+    /** The configuration object, the bundle it was in if it was in one, and its key. */
+    private class SignInConfig(
+        val config: Parcelable,
+        val bundle: Bundle?,
+        val key: String = GoogleSignInHandoff.CONFIG_KEY,
+    )
 
     /**
      * Finds the configuration in either shape the client library writes it.
@@ -245,11 +249,27 @@ object VirtualActivityTaskManagerHook {
         if (bundle != null) {
             @Suppress("DEPRECATION")
             val inner = bundle.getParcelable<Parcelable>(GoogleSignInHandoff.CONFIG_KEY)
-            return@runCatching inner?.let { SignInConfig(it, bundle) }
+            if (inner != null) return@runCatching SignInConfig(inner, bundle)
         }
         @Suppress("DEPRECATION")
         val direct = intent.getParcelableExtra<Parcelable>(GoogleSignInHandoff.CONFIG_KEY)
-        direct?.let { SignInConfig(it, null) }
+        if (direct != null) return@runCatching SignInConfig(direct, null)
+
+        // The key is not what this depends on. If a release of the client library ever
+        // spells it differently, the *type* is still what it is, and the extras of an
+        // intent the guest built in this process are already objects — so one pass over
+        // them costs nothing and removes a name from the contract.
+        val extras = intent.extras ?: return@runCatching null
+        for (key in extras.keySet()) {
+            @Suppress("DEPRECATION")
+            val value = runCatching { extras.get(key) }.getOrNull()
+            if (value is Parcelable &&
+                GoogleSignInHandoff.looksLikeConfiguration(value.javaClass.name)
+            ) {
+                return@runCatching SignInConfig(value, null, key)
+            }
+        }
+        null
     }.getOrNull()
 
     /**

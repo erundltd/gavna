@@ -81,6 +81,20 @@ object GoogleSignInHandoff {
     /** The extra `SignInHubActivity` puts the configuration under, in both shapes. */
     const val CONFIG_KEY = "config"
 
+    /**
+     * The class the configuration is, by name, for the case where the key is not `config`.
+     *
+     * A suffix and not the whole name: the class has lived in
+     * `com.google.android.gms.auth.api.signin.internal` for years, but a key name is a
+     * weaker thing to depend on than a type, and the fallback that uses this costs one
+     * pass over extras that are already materialised.
+     */
+    const val CONFIG_CLASS_SUFFIX = "SignInConfiguration"
+
+    /** True for the class name of a sign-in configuration, whoever obfuscated the rest. */
+    fun looksLikeConfiguration(className: String?): Boolean =
+        className != null && className.substringAfterLast('.').endsWith(CONFIG_CLASS_SUFFIX)
+
     /** A Google OAuth client id always ends this way, whatever project issued it. */
     private const val CLIENT_ID_SUFFIX = ".apps.googleusercontent.com"
 
@@ -89,19 +103,30 @@ object GoogleSignInHandoff {
     /**
      * Instance fields of [config] whose value is exactly [guestPackage].
      *
-     * Declared fields only, and only `String`s: the configuration is a flat SafeParcelable
-     * whose consumer package is a top-level field, and searching deeper would risk
-     * rewriting a package name that means something else.
+     * The object's own fields and its superclasses', and only `String`s. It does **not**
+     * descend into the objects those fields point at: the consumer package is a top-level
+     * field of the configuration, and a package name nested inside the options means
+     * something else — a hosted domain, an account — that must not be rewritten.
      */
-    fun consumerFields(config: Any, guestPackage: String): List<Field> =
-        config.javaClass.declaredFields
-            .filter { !Modifier.isStatic(it.modifiers) && it.type == String::class.java }
-            .filter { field ->
-                runCatching {
+    fun consumerFields(config: Any, guestPackage: String): List<Field> {
+        val fields = ArrayList<Field>(2)
+        // The whole hierarchy, not one class: a SafeParcelable's fields are its own today
+        // and `declaredFields` would silently miss an inherited one if that ever changed.
+        var type: Class<*>? = config.javaClass
+        while (type != null && type != Any::class.java) {
+            for (field in type.declaredFields) {
+                if (Modifier.isStatic(field.modifiers)) continue
+                if (field.type != String::class.java) continue
+                val matches = runCatching {
                     field.isAccessible = true
                     field.get(config) == guestPackage
                 }.getOrDefault(false)
+                if (matches) fields += field
             }
+            type = type.superclass
+        }
+        return fields
+    }
 
     /**
      * Replaces every field naming the guest with [hostPackage]. Returns how many changed.

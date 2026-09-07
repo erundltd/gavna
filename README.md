@@ -39,7 +39,7 @@ never written as `SUPPORTED` because something ought to work.
 
 | | |
 |---|---|
-| **Off-device tests** | 300 JVM tests, 104 native checks, 15 Dart tests, 135 tool tests — all passing |
+| **Off-device tests** | 302 JVM tests, 104 native checks, 15 Dart tests, 135 tool tests — all passing |
 | **On-device suite** | **46 of 46** instrumented tests pass, on an Android 14 x86_64 emulator |
 | **On a real phone** | Seventeen runs. **The eleventh ran a game to its own login screen and took a touch on it** — Standoff 2, Unity 6 on IL2CPP, its expansion file read out of the instance's own storage, FMOD, Firebase and AppMetrica all up, drawing at 2400×1080 on the hardware renderer. **The seventeenth is the first in which the paths a guest reports for its own APK were both installed-shaped and openable** (`code=true`). Sixty-odd causes found and fixed across the seventeen runs and the emulator work between them. The changes made since run 17 — SQLite through its own VFS interface, and the Google sign-in handoff — are not yet back on hardware |
 | **Real applications** | Seven from F-Droid — Termux, Fossify Gallery, NewPipe, Shattered Pixel Dungeon, AntennaPod, KeePassDX, Aegis — imported and launched on the emulator. All seven reach their own main activity on the hardware renderer; seven faults were fixed to get there, none of which the probe could have found |
@@ -202,7 +202,7 @@ Three build types, and the difference matters:
 ## Testing
 
 ```bash
-./gradlew test                    # 300 JVM tests
+./gradlew test                    # 302 JVM tests
 ./tools/native-test/run.sh        # 104 host-side native checks, no device needed
 (cd ui && flutter test)           # 15 Dart tests
 ./tools/device-log/self_test.py   # 105 tests for the device-log analyzer, no toolchain

@@ -303,6 +303,115 @@ report field is `Path`, and the request it rides on is `GoogleAuthRequest`.
 
 ---
 
+## The network stack, as far as the APK shows it
+
+Asked directly: is the game's networking — matches and the rest — visible in the APK?
+
+**The shape of it is completely visible. None of the logic is.** The same property that
+made the detection readable does it here: IL2CPP metadata is linked into `libunity.so` in
+the clear, so every C# type, method and field *name* is in the binary, and protobuf's C#
+backend additionally embeds each `.proto` file's descriptor as base64 — which means field
+*numbers and types* survive too. What does not survive is anything that was compiled:
+method bodies are ARM64 machine code, and the class names around them are the same
+fifteen-character garbage the anti-cheat's are.
+
+There are three layers and they are not the same technology.
+
+### 1. The meta backend — protobuf, package `com.axlebolt.bolt`
+
+Everything that is not the shooting: auth, lobby, matchmaking tickets, inventory,
+marketplace, clans, chat, stats, battle pass. **1,081** distinct `*Request` / `*Response`
+type names are in the string table, and 889 field definitions — a name and a field number each —
+were decoded out of the embedded descriptors. Named packages seen in them: `com.axlebolt.bolt`,
+`.bolt.matches`, `.bolt.matchmaking`, `.bolt.stats`, `.bolt.stats.gameserver`, `.bolt.Store`.
+
+Two readings worth stating, because both were checked rather than assumed:
+
+- **No gRPC service definitions are in it.** Zero `service` blocks and zero rpc methods
+  survive in the descriptor bytes — the scan below finds them wherever they exist, and the
+  only `ServiceOptions` in the binary belong to `descriptor.proto` itself. The reading, and
+  it is a reading: dispatch is by request type through the client's own `BoltApi` /
+  `BoltClient`, not through generated stubs.
+- **The dedicated server's own API ships in the client build.** `GSGetPlayersStatsRequest`,
+  `GSIncrementPlayersStatsRequest`, `ConsumeItemsByServerRequest`, `ExecuteRecipeByServerRequest`,
+  `FinishMatchRequest`, `ConfirmMatchRequest`, `AbandonMatchRequest`, `BanGamePlayerRequest`,
+  `CheckBanGamePlayerRequest` and — the one that says most about how the game is policed —
+  `AccusationByServerRequest`. Bans and accusations are things the *server* sends about a
+  player, and the client carries the definitions because the game server is built from the
+  same assemblies.
+
+The recovery is partial by construction: IL2CPP does not keep a descriptor's base64 chunks
+contiguous, so whole `.proto` files cannot be reassembled — 889 fields is a floor, not the
+schema.
+
+### 2. The room layer — Photon (Exit Games)
+
+`Photon3Unity3D.dll`, `PhotonPeer`, name server → master server → game server, regions,
+`JoinRoom` / `JoinRandomRoom` / `ReconnectAndRejoin`, and a
+`com.axlebolt.bolt.PhotonGame` message with custom properties on the protobuf side.
+The PUN-era types (`PhotonView`, `PhotonNetwork`, `PhotonSerializeView`, `PhotonStreamQueue`,
+`PhotonInstantiate`) are still in the build alongside the framework below, which is what a
+migration in progress looks like from the outside.
+
+### 3. The match itself — `Axlebolt.NetCode` over LiteNetLib (UDP)
+
+Their own netcode framework, and its vocabulary is the standard server-authoritative one:
+
+```
+Axlebolt.NetCode.Framework.Snapshots     Axlebolt.NetCode.Framework.TimeSync
+Axlebolt.NetCode.Framework.Network.Client   …Network.Transport
+Axlebolt.NetCode.Transport.LiteNetLibAdapter   LiteNetLibClientTransport / …ServerTransport
+Axlebolt.Standoff.NetCode.CustomConverters.Quantisation.Vectors
+ClientWorld.ReceiveWorld  ClientWorld.ProcessPrediction  ClientWorld.InterpolateWorld
+ClientWorld.ProcessCommands  ClientWorld.TransportSend   ClientWorldOptions / ServerWorldOptions
+WorldSnapshot   "Could not find world snapshot for tick id"   CascadeRollback
+```
+
+Snapshot names name the replicated state: `TransformSnapshot`, `WeaponStateSnapshot`,
+`DamageSnapshot`, `CollisionSnapshot`, `SurfaceHitSnapshot`, `StunSnapshot`, `BlindSnapshot`,
+`FlamePositionSnapshot`, `GraffitiPlayerStateSnapshot`, `ChatMessageSnapshot`. Twenty-two
+names end in `Rpc`, of which fifteen are the game's: `SelectTeamRpc`, `SelectTeamAutoRpc`,
+`WeaponShopBuyRequestRpc`, `WeaponShopBuyRequestCancelRpc`, `WeaponShopAutoBuyRequestRpc`,
+`WeaponShopChargebackRpc`, `PositionMarkerRequestRpc`, `GraffitiDrawRpc`, `ChatMessageRpc`,
+`SetVoteRpc`, `StartVotingRpc`, `SpectateRpc`, `SetRandomWeaponsStateRpc`, `ConsoleCommandRpc`,
+`SendConsoleCommandRpc`.
+
+That list is the whole *named* rpc surface of a round, and what is not in it is the
+interesting half: there is no "I hit him" and no "my position is". Everything the client
+sends about the actual play is an input command against a tick the server owns
+(`ClientWorld.ProcessCommands`, `ClientWorld.TransportSend`), and even buying is a request
+the server can reverse afterwards — `WeaponShopChargebackRpc` exists because the server,
+not the client, decides whether the purchase happened.
+
+The wire format is **not** protobuf here. `Axlebolt.NetCode.Serialization` generates binary
+serializers (`BinarySerializerGeneratedAttribute`, `BinarySerializerPrimitiveAttribute`) and
+the vector converters quantise, so a match packet is bit-packed by code that only exists
+compiled. Names tell you what a packet contains; they do not tell you where the bits are.
+
+### Hosts in the binary
+
+`dev-matchmaking.bolt-api.com`, `metrics.standoff2.io`, `fra01.metrics.ms.boltgaming.io:9111`,
+`avatars.cdn.boltgaming.io`, `link.standoff2.com`, `install.standoff2.com`, `help.standoff2.com`,
+plus Photon's `ns.exitgamescloud.com`. Voice is Vivox ("Connected to Vivox").
+
+### One correction, because the name invites the opposite guess
+
+`lib/arm64-v8a/libsigner.so` (1.1 MB) is **not** the game's anti-cheat or its request
+signer. Its only exported entry point is `Java_com_adjust_sdk_sig_NativeLibHelper_nSign` —
+it is the Adjust attribution SDK's signature library. The game's own verification is the
+`AppVerification` message documented above, built in C# and carried on the auth call.
+
+### What this changes for UNIQUE: nothing
+
+The wall is where the section above says it is — `AppVerification` riding on
+`GoogleAuthRequest`, read by a server. Nothing in the match protocol is on UNIQUE's path,
+and nothing in this section is a step toward touching it: UNIQUE runs a guest unmodified,
+and reading a protocol's shape out of a binary is not the same activity as speaking it.
+This is recorded because "is the networking visible?" is a question that will be asked
+again, and answering it a second time costs the same day it cost the first time.
+
+---
+
 ## How to reproduce every claim here
 
 ```bash
@@ -346,4 +455,51 @@ done
 
 # 7. The hard-coded cheat-path list.
 grep -ao 'io.va.exposed[^ ]*' s.txt | head -1
+
+# 8. The three network layers, by the names they leave behind.
+grep -ao 'Axlebolt.NetCode[A-Za-z0-9_.]*' s.txt | sort -u
+grep -ao 'ClientWorld[A-Za-z0-9_.]*' s.txt | sort -u
+grep -aoE '[A-Za-z0-9_]{3,50}Rpc\b' s.txt | sort -u            # 22, fifteen of them the game's
+grep -aoE '[A-Za-z0-9_]{2,40}(Request|Response)\b' s.txt | sort -u | wc -l   # 1081
+
+# 9. The protobuf schema, as far as IL2CPP leaves it recoverable.
+#    protoc's C# backend embeds each .proto file's descriptor as base64, split into
+#    60-character literals. IL2CPP keeps the literals but not their order, so whole files
+#    cannot be reassembled — individual chunks still decode, and a field definition or an
+#    rpc method is recognisable in the wire encoding on its own.
+python3 - <<'SCAN'
+import base64, re
+d = open('x/lib/arm64-v8a/libunity.so', 'rb').read()
+pile = []
+for m in re.finditer(rb'[A-Za-z0-9+/]{40,}={0,2}', d):
+    r = m.group(0)
+    for ph in range(4):                       # the run's start is not chunk-aligned
+        c = r[ph:]; c = c[:len(c) // 4 * 4]
+        if len(c) >= 40:
+            try: pile.append(base64.b64decode(c))
+            except Exception: pass
+b = b'\xff\xff\xff\xff'.join(pile)
+def lp(i):                                    # length-prefixed identifier at i
+    n = b[i] if i < len(b) else 0
+    s = b[i+1:i+1+n]
+    return (s.decode(), i+1+n) if 1 <= n <= 120 and re.fullmatch(rb'[A-Za-z0-9_.]+', s) else None
+fields, rpcs = set(), set()
+for m in re.finditer(rb'\x0a', b):
+    a = lp(m.start() + 1)
+    if not a: continue
+    name, j = a
+    if j + 6 <= len(b) and b[j] == 0x18 and b[j+2] == 0x20 and b[j+4] == 0x28:
+        fields.add((name, b[j+1]))            # field name, field number
+    if j < len(b) and b[j] == 0x12:           # rpc: name, input_type, output_type
+        i2 = lp(j + 1)
+        if i2 and i2[0].startswith('.') and i2[1] < len(b) and b[i2[1]] == 0x1a:
+            o = lp(i2[1] + 1)
+            if o and o[0].startswith('.'): rpcs.add((name, i2[0], o[0]))
+print(len(fields), 'field definitions,', len(rpcs), 'rpc methods')   # 889, 0
+SCAN
+
+# 10. libsigner.so is Adjust's, not the game's.
+unzip -o app.apk 'lib/arm64-v8a/libsigner.so' -d x
+llvm-readelf --dyn-syms x/lib/arm64-v8a/libsigner.so | grep -o 'Java_[A-Za-z0-9_]*'
+#   Java_com_adjust_sdk_sig_NativeLibHelper_nSign
 ```

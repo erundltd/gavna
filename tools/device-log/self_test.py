@@ -60,6 +60,8 @@ FIXTURE16 = os.path.join(HERE, "fixtures", "redmi-android15-run16.log")
 FIXTURE16_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run16.device.txt")
 FIXTURE17 = os.path.join(HERE, "fixtures", "redmi-android15-run17.log")
 FIXTURE17_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run17.device.txt")
+FIXTURE18 = os.path.join(HERE, "fixtures", "redmi-android15-run18.log")
+FIXTURE18_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run18.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -1142,9 +1144,86 @@ class RedmiRun17Test(unittest.TestCase):
         self.assertEqual(self.checks["signin"].verdict, analyze.PASS)
         self.assertIn("no Google sign-in was attempted", notes(self.checks["signin"]))
 
-    def test_google_is_the_only_failing_check(self):
+    def test_the_published_apk_path_is_one_the_game_itself_cannot_open(self):
+        # Read only after the eighteenth run, and it was in this log all along: the code
+        # gate said `code=true` because Java could open the path, and Unity — the guest's
+        # own engine, whose libraries the redirect had not reached — could not.
+        detail = findings(self.checks["paths"])
+        self.assertIn("a published path did not resolve for Unity", detail)
+        self.assertIn("the caller could not open it", detail)
+
+    def test_google_and_the_paths_are_the_failing_checks(self):
         failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
-        self.assertEqual(failing, ["google"])
+        self.assertEqual(failing, ["google", "paths"])
+
+
+class RedmiRun18Test(unittest.TestCase):
+    """The eighteenth run: both halves published, and the game could not read its own APK.
+
+    Two things landed and one broke, and the log says all of it in three lines.
+
+    **The SQLite fix works.** Through SQLite's own VFS interface rather than through its
+    relocations, on the phone, first attempt:
+
+    ```
+    io_redirect: sqlite 8/8 system call(s) replaced (library=yes api=yes vfs=v3)
+    GUEST_PATHS_PUBLISHED … code=true slots=102 sqlite=8 data=true
+        detail=both paths round-tripped into the instance
+    ```
+
+    `data=true` for the first time in the project's history, and the `+packed` marker on
+    every platform library confirms the seventeenth run's diagnosis outright:
+    `libsqlite.so=2+abs+packed` — absolute patching enabled, relocations packed, nothing
+    found. The mechanism it replaced could never have worked.
+
+    **And publishing the code path broke the game**, which no check noticed:
+
+    ```
+    E Unity: ApkAddCentralDirectory : Unable to open '/data/app/~~kx_uUO…/base.apk'
+    E Unity: Failed to read assets/bin/Data/unity_app_guid
+    ```
+
+    Standoff 2 was showing *"Not enough storage space to install required resources."* on
+    screen while the `paths` check reported both halves published and passed. From the
+    game's point of view its own APK was gone: it was handed the installed-shaped path and
+    its own engine could not open it, because `libunity.so`'s file calls were not
+    redirected. The sixteenth run — the last one with `code=false` — has no Unity error at
+    all, so the regression arrived with the publication.
+
+    Two causes, both in the redirect and both confirmed against bionic rather than
+    reasoned about:
+
+    - **`__open_2`.** A release build's two-argument `open` is not a call to `open`; it is
+      `__open_2`, which the table did not have. What it did have was `__openat`, which
+      bionic does not export at all.
+    - **The load watch was never re-armed.** `libunity.so` is `dlopen`ed by `libmain.so`,
+      not by the platform loader, and only libraries present when the watch was installed
+      had their own `dlopen` hooked. There is no rescan for `libunity.so` in this log.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE18, FIXTURE18_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_both_halves_of_the_path_were_published(self):
+        self.assertIn("code and data paths both published", notes(self.checks["paths"]))
+
+    def test_the_guest_could_not_open_the_path_it_was_published(self):
+        # The finding this fixture exists for. It was on the tester's screen and in this
+        # log, and every check passed.
+        detail = findings(self.checks["paths"])
+        self.assertIn("a published path did not resolve for Unity", detail)
+        self.assertIn("base.apk", detail)
+        self.assertEqual(self.checks["paths"].verdict, analyze.FAIL)
+
+    def test_the_engine_itself_did_not_regress(self):
+        for name in ("engine", "launch", "slots", "crash", "native", "detection", "render"):
+            self.assertEqual(self.checks[name].verdict, analyze.PASS, name)
+
+    def test_google_and_paths_are_the_failing_checks(self):
+        failing = sorted(n for n, c in self.checks.items() if c.verdict == analyze.FAIL)
+        self.assertEqual(failing, ["google", "paths"])
 
 
 SIGN_IN_RETARGETED = """\
@@ -1218,6 +1297,54 @@ detail=a database cannot be opened through the public path: SQLiteDiskIOExceptio
 """
 
 SQLITE_REDIRECTED = SQLITE_UNREDIRECTED.replace("sqlite=0", "sqlite=8")
+
+
+PUBLISHED_THEN_UNOPENABLE = """\
+2026-01-01 10:00:00.000 I PROCESS PROCESS_START process=com.unique kind=CORE sdk=35 abi=arm64-v8a
+2026-01-01 10:00:03.000 I LAUNCH GUEST_PATHS_PUBLISHED package=com.example.app code=true \
+slots=102 sqlite=8 data=true apk=/data/app/~~aaaa/com.example.app-bbbb \
+detail=both paths round-tripped into the instance
+1788775238.812 10316 900 900 E Unity   : ApkAddCentralDirectory : Unable to open \
+'/data/app/~~aaaa/com.example.app-bbbb/base.apk'
+"""
+
+PUBLISHED_AND_OPENABLE = PUBLISHED_THEN_UNOPENABLE.rsplit("1788775238.812", 1)[0]
+
+
+class PublishedPathReadableTest(unittest.TestCase):
+    """A published path the guest's own engine cannot open.
+
+    The eighteenth run had this on the tester's screen — *"Not enough storage space to
+    install required resources."* — and passed every check, because the gate that decides
+    whether to publish asks `java.io.File`, and `java.io.File` is one of the libraries the
+    redirect reaches. The caller that could not was the game's own.
+
+    `statfs(<path>) failed: …` was already caught. `Unable to open '<path>'` is the same
+    fact in the spelling an app's own engine uses, and matching only the first is why a
+    broken run read as a clean one.
+    """
+
+    def check_for(self, text: str) -> analyze.Check:
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        tmp.write(text)
+        tmp.close()
+        try:
+            parsed = analyze.load(tmp.name, None)
+            return {c.name: c for c in analyze.run_checks(parsed)}["paths"]
+        finally:
+            os.unlink(tmp.name)
+
+    def test_a_guest_that_cannot_open_its_published_apk_fails_the_check(self):
+        check = self.check_for(PUBLISHED_THEN_UNOPENABLE)
+        self.assertEqual(check.verdict, analyze.FAIL)
+        self.assertIn("the caller could not open it", findings(check))
+
+    def test_publishing_both_halves_with_nothing_complaining_passes(self):
+        check = self.check_for(PUBLISHED_AND_OPENABLE)
+        self.assertEqual(check.verdict, analyze.PASS)
+        self.assertIn("code and data paths both published", notes(check))
 
 
 class SqliteRedirectTest(unittest.TestCase):

@@ -439,6 +439,17 @@ _PATH_FAILED = re.compile(
     r"(/data/app/~~[A-Za-z0-9_-]+/[^\s):,]+)\)? failed: (.+)"
 )
 
+# The same failure said the other way round, which is how the guest's *own* code says it.
+#
+# `statfs(<path>) failed: …` is a system library reporting an errno. An app's own engine
+# does not: Unity prints `Unable to open '<path>'` and then tells its player the device is
+# out of storage. Both mean a path UNIQUE published cannot be opened by the caller that
+# was handed it, and the eighteenth run is why the second spelling is here — the `paths`
+# check passed that run while the game was showing an error dialog.
+_PATH_UNOPENABLE = re.compile(
+    r"[Uu]nable to open '(/data/app/~~[A-Za-z0-9_-]+/[^']+)'"
+)
+
 
 def check_guest_paths(run: Run) -> Check:
     """Did the paths a guest was told it has actually resolve?
@@ -520,12 +531,16 @@ def check_guest_paths(run: Run) -> Check:
     prefixes = {e["apk"] for e in published if e["apk"]}
     reported: Set[str] = set()
     for line in run.lines:
-        if line.tag == UNIQUE_TAG or "failed" not in line.message:
+        if line.tag == UNIQUE_TAG:
             continue
-        m = _PATH_FAILED.search(line.message)
-        if not m:
-            continue
-        path, reason = m.group(1), m.group(2).strip()
+        m = _PATH_FAILED.search(line.message) if "failed" in line.message else None
+        if m is None:
+            unopenable = _PATH_UNOPENABLE.search(line.message)
+            if unopenable is None:
+                continue
+            path, reason = unopenable.group(1), "the caller could not open it"
+        else:
+            path, reason = m.group(1), m.group(2).strip()
         if not any(path.startswith(prefix) for prefix in prefixes):
             continue
         key = f"{line.tag}:{reason}"

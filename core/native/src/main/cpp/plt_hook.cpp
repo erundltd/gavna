@@ -337,7 +337,18 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
         patch_relocations(dynamic.rela, dynamic.rela_count, dynamic,
                           info->dlpi_addr, ctx);
     }
-    if (ctx->here > 0 && ctx->report->per_library.size() < 64) {
+    // Named whenever it patched something, and also whenever it is one of the guest's own
+    // libraries and patched *nothing*.
+    //
+    // The second half is the eighteenth run's lesson. `libunity.so` does not appear in
+    // that log at all, and there are two reasons a library can be missing from this list —
+    // it was never scanned, or it was scanned and matched no symbol — which are a missing
+    // rescan and a missing symbol respectively, and cost a round to tell apart. A library
+    // under `/data/` is the guest's own or UNIQUE's; the platform's hundreds are not
+    // listed when they patch nothing, because they never needed to be.
+    const bool app_private = info->dlpi_name != nullptr &&
+                             strstr(info->dlpi_name, "/data/") != nullptr;
+    if ((ctx->here > 0 || app_private) && ctx->report->per_library.size() < 64) {
         const char* name = info->dlpi_name;
         const char* base = (name == nullptr) ? "" : strrchr(name, '/');
         ctx->report->per_library.emplace_back(

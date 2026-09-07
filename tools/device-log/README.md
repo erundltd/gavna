@@ -153,6 +153,21 @@ services**, and **a guest was told it does not**. Hiding it from an instance tha
 one that has proved nothing is, and so is the app's own
 `requires Google Play services, but they are missing` on a phone that has them.
 
+### What the eighteenth run added to `paths`
+
+The check matched `statfs(<path>) failed: …` — a system library reporting an errno — and
+nothing else. An app's own engine does not say that. Unity says:
+
+```
+E Unity: ApkAddCentralDirectory : Unable to open '/data/app/~~kx_uUO…/base.apk'
+```
+
+and then tells its player the device is out of storage. So the eighteenth run passed every
+check except `google` while the tester was looking at an error dialog. Both spellings are
+read now, and runs 17 and 18 fail on it — which is the point: a published path the guest's
+own code cannot open is worse than a path that was never published, because it works for
+the callers the redirect reaches and not for the rest.
+
 ### The one the seventeenth run added: `signin`
 
 Separate from `google`, and the separation is the finding. `google` asks whether a guest

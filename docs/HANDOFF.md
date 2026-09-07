@@ -60,14 +60,14 @@ exist because a claim was made without evidence and a later phone log contradict
 - `/proc/self/maps` inside a guest no longer names UNIQUE — `PROC_VIEW_INSTALLED …
   named=16 leaked=0` on the phone, and the graft checks its own work.
 - Two instances of one app have separate identities, storage and `ANDROID_ID`.
-- 302 JVM tests, 104 host-side native checks, 118 device-log tests, 17 APK-survey tests, 15
+- 302 JVM tests, 142 host-side native checks, 125 device-log tests, 17 APK-survey tests, 15
   Dart tests. All passing.
 
 ### Does not work
 
 | | Where it stands |
 |---|---|
-| **The "virtual space" notice in Standoff 2** | The code half of the path fix is **live on hardware** as of run 17 (`code=true`); the data half is not, and the notice has not been seen either way since. See §4. |
+| **The "virtual space" notice in Standoff 2** | Both halves are live on hardware as of run 18 (`code=true data=true sqlite=8`) — and publishing them broke the game, which showed *"Not enough storage space to install required resources"* because its own engine could not open the APK path it had been handed. Two causes found and fixed (§6, "the two the eighteenth run found"); **untested**. The notice itself has still never been observed with the paths intact. See §4. |
 | **Google sign-in** | Fails as "Попытка входа отменена". Run 17 changed what is known about *why*: the refusal is timed at under half a second with no account picker drawn, which is not the OAuth-client wall this project had been describing. A fix is in this build and **has not been run on a phone**. §5 and `docs/GOOGLE_SIGN_IN.md` §0. |
 | **Sign-in through a browser** (Facebook, VK, most OAuth) | The identity half already works; the *return* leg does not. This is the highest-value unbuilt piece. §5. |
 | **Attestation** (Play Integrity, vendor device checks) | Out of reach and stated as such. UNIQUE is not an attestation bypass. |
@@ -90,9 +90,9 @@ The NDK is installed by Gradle on first native build. AGP 8.13.0, Kotlin 2.2.20.
 
 ```bash
 ./gradlew test                    # 302 JVM tests
-./tools/native-test/run.sh        # 104 host-side native checks, no device
+./tools/native-test/run.sh        # 142 native checks; 38 need an NDK and skip without one
 (cd ui && flutter test)           # 15 Dart tests
-./tools/device-log/self_test.py   # 118 tests for the log analyzer, no toolchain
+./tools/device-log/self_test.py   # 125 tests for the log analyzer, no toolchain
 ./tools/apk-survey/self_test.py   # 17 tests
 ./tools/check-translations.py     # every engine failure has both languages
 ./tools/report-unimplemented.sh   # every deliberately unimplemented surface
@@ -201,16 +201,20 @@ Neither half is applied until it is measured:
 
 `GUEST_PATHS_PUBLISHED package=… code=… data=… slots=… apk=… detail=…` reports both.
 
-**Current state: `code=true`, `data=false`** — measured on the phone, run 17. The
-sixteenth run's fix (§6, "`java.io.File` is two libraries") held: `libopenjdk.so` in scope
-plus the large-file symbol spellings produced the first log in which a guest was handed an
-installed-shaped APK path that actually opened.
+**Current state: `code=true`, `data=true`** — measured on the phone, run 18, with
+`sqlite=8`. Both halves of the identity a guest reports for itself are published and both
+round-trip.
 
-The data half refused with the fourteenth run's SQLite message, in a build that was meant
-to have closed it — see §6, "SQLite was never redirected at all". That fix is in this
-build and has not been run on a phone. **The virtual-space notice has still never been
-observed with both halves intact**, and it only appears after a login, so a run without one
-proves nothing.
+**And that is not the same as working.** In the same run the game showed *"Not enough
+storage space to install required resources"*, because `libunity.so` could not open the
+APK path UNIQUE had just published to it. The gate that decides whether to publish asks
+`java.io.File`, which the redirect covers; the caller that failed was the guest's own,
+which it did not. Two causes, both fixed and both **untested**: `__open_2` (§6) and a
+library-load watch that was never re-armed (§6). Until a run says otherwise, treat
+`code=true data=true` as *published*, not as *safe*.
+
+The virtual-space notice has still never been observed with the paths intact, and it only
+appears after a login, so a run without one proves nothing.
 
 ---
 
@@ -326,6 +330,7 @@ This is where most of the recent work happened and where the next bug will proba
 | **everything** (`scope=*`, 436 slots in 385 libraries) | 15 | the Mali driver could not find its gralloc mapper and **aborted the render thread**: `mali_config_interface_mapper: Failed to acquire IMapper service. Aborting.` + `SIGABRT` |
 | named list derived from run 15's own per-library output | 16 | the code gate still refused — see below |
 | + `libopenjdk.so` and the large-file symbol spellings | 17 | **`code=true`.** The scope is right now; what was left was not a scope problem at all |
+| SQLite through `xSetSystemCall`, not through relocations | 18 | **`data=true`, `sqlite=8`** — and the game could not open the path it had been given, for two reasons that are not about scope either |
 
 **The lesson from run 15, which is the important one**: the safety argument ("no rule can
 match `/data/user/0/com.unique`, so a hooked library touching UNIQUE's files is unaffected")
@@ -373,6 +378,34 @@ Read `sqlite=<n>` on `IO_REDIRECT_INSTALLED` and on `GUEST_PATHS_PUBLISHED`. Zer
 database refusal is now a `paths` failure rather than a note, and `+packed` on the
 per-library line confirms or retracts the premise above directly.
 
+### The two the eighteenth run found, and how both hid
+
+Both are in the redirect, both were verified against bionic's own `libc.so` rather than
+reasoned about, and both are the same kind of mistake as the packed relocations: a
+mechanism that reported success while reaching nothing.
+
+**`__open_2`, and the `__openat` that never existed.** The NDK turns on `_FORTIFY_SOURCE`
+at every optimisation level, so a release build's `open(path, O_RDONLY)` compiles to a
+call to **`__open_2`** — a different symbol. The table did not have it. What it had was
+`__openat`, which bionic does not export at all, so it matched nothing and printed as a
+symbol nothing imports, in the same line as `open64` and `creat64`, which are real and
+merely unused. `llvm-readelf --dyn-syms` on the NDK's `libc.so` settles it in one command;
+`tools/native-test/check_libc_symbols.py` now runs that check over every name in the table
+and skips with a message where there is no NDK.
+
+Added: `__open_2`, `__openat_2`, `__readlink_chk`, `__readlinkat_chk`. Removed:
+`__openat`.
+
+**The load watch was armed once.** It hooks `dlopen` in the libraries loaded at the moment
+it is installed. `System.loadLibrary` goes through `libnativeloader.so`, which is one of
+them; a library that then `dlopen`s another itself is not. Unity is exactly that shape —
+`libmain.so` pulls in `libunity.so` — and run 18 contains no rescan for `libunity.so` at
+all. `rescan_after_load` re-arms the watch as well as the redirect now, and `g_watching`
+is sticky so a quiet re-arm is not read as a failed one.
+
+Run 17 is what proves these are two faults and not one: it *does* contain
+`hooked libunity.so=2`, 1.7 seconds before Unity failed anyway.
+
 ### If a published path still does not resolve
 
 The gate now separates its three failure modes and says which:
@@ -408,7 +441,7 @@ phone run is checked in as a fixture under `tools/device-log/fixtures/` with ass
 `self_test.py`, so **a check that stops reporting a fault a real phone produced is a
 regression in the tool** rather than progress in the engine.
 
-Fifteen captures are checked in — the first run, then runs 4 through 17; runs 2 and 3
+Sixteen captures are checked in — the first run, then runs 4 through 18; runs 2 and 3
 predate the analyzer and were never kept. When a new log arrives:
 
 1. run the analyzer;
@@ -423,16 +456,21 @@ predate the analyzer and were never kept. When a new log arrives:
 
 ## 8. What to do next, in order
 
-1. **The eighteenth run.** Two changes, in two subsystems, and the log separates them.
+1. **The nineteenth run**, and the first question is whether the game starts at all.
+   - **No "Not enough storage space" dialog**, and no `E Unity: ApkAddCentralDirectory`
+     in the log. That is the whole of what the two fixes above are for. If it is still
+     there, the log now names the library that patched nothing —
+     `io_redirect: hooked libunity.so=0+packed` — and the answer is a symbol the table
+     still does not have, not a rescan that did not run.
+   - **`io_redirect: hooked … after loading …/libunity.so`.** Its presence is the watch
+     re-arm working. Its absence with a working game means Unity was covered by the
+     initial scan instead.
    - **Google sign-in.** Tap the Google button in Standoff 2. Watch for
      `GOOGLE_SIGN_IN_RETARGETED … to=com.unique serverToken=…` and then for whether an
      account picker appears at all. The `signin` check times the answer: under two seconds
      is the identity refusal again; longer means the picker was drawn and whatever came
      back is a different answer. `DEVELOPER_ERROR` after an account is chosen would be the
      OAuth-client wall, reached for the first time.
-   - **`data=true`.** `sqlite=<n>` on `GUEST_PATHS_PUBLISHED` says whether SQLite's own
-     syscall table was replaced. Zero means the VFS interface was not reached; a non-zero
-     count with `data=false` is a new fault, downstream of the redirect.
    - **Apps that had data still having it** — a redirect gone wrong shows as an app that
      looks empty, not one that crashes. **Ask the tester to open two or three before the
      game.**

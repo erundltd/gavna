@@ -13,6 +13,11 @@ done
 # See reloc_shape.c: this is the construct that made SQLite's `stat` invisible to a GOT
 # hook, and the check is that it still produces an absolute data relocation with a zero
 # addend — the case `plt_hook.cpp::is_address_slot` was taught to accept.
+# Every name the redirect asks libc for is a name libc actually has. See the script: the
+# one that was not cost the eighteenth phone run, and printed the same line as the ones
+# that were merely unused.
+python3 "$here/check_libc_symbols.py"
+
 # The symbol walk `sqlite_vfs.cpp` reaches SQLite's own VFS interface through, checked
 # against a real linker's output and against dlsym's answer for the same name.
 ${CC:-gcc} -O1 -fPIC -shared -o "$out/elf_probe.so" "$here/elf_probe.c"

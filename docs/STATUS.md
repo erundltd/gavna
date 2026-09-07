@@ -53,7 +53,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**302 JVM tests, 15 Dart tests, 104 native checks, 135 off-device tool tests — all passing.**
+**302 JVM tests, 15 Dart tests, 142 native checks (38 of them need an NDK and skip without one), 142 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1529,6 +1529,90 @@ log states the premise instead of implying it.
 
 **No Google sign-in was attempted in this run**, and the `signin` check says exactly that
 rather than passing quietly.
+
+### The eighteenth run: SQLite landed, and publishing the path broke the game
+
+Two things in one log, and they point in opposite directions.
+
+**The SQLite fix works, on the first attempt, on hardware.**
+
+```
+io_redirect: sqlite 8/8 system call(s) replaced (library=yes api=yes vfs=v3)
+GUEST_PATHS_PUBLISHED … code=true slots=102 sqlite=8 data=true
+    detail=both paths round-tripped into the instance
+```
+
+`data=true` for the first time in this project's history. Both halves of the identity a
+guest reports for itself are now published *and* they round-trip — a byte written through
+the public path arrives in the instance through `java.io`, and a database opened through it
+does too.
+
+The same log confirms the seventeenth run's diagnosis outright, in the marker added for
+exactly that purpose:
+
+```
+io_redirect: hooked libsqlite.so=2+abs+packed
+io_redirect: hooked libjavacore.so=11+packed
+io_redirect: hooked libopenjdk.so=14+packed
+```
+
+Every platform library in scope is `+packed`. The absolute-relocation patch was enabled for
+`libsqlite.so` and there was no relocation array for it to walk. It could never have
+worked, and now nothing depends on it.
+
+**And the tester's screen said this:**
+
+> **Error** — Not enough storage space to install required resources.
+
+with, in the log:
+
+```
+E Unity: ApkAddCentralDirectory : Unable to open '/data/app/~~kx_uUO…/base.apk'
+E Unity: Failed to read assets/bin/Data/unity_app_guid
+```
+
+The game was handed the installed-shaped path for its own APK and **its own engine could
+not open it**, so it concluded its resources were not installed. The sixteenth run — the
+last with `code=false` — has no Unity error at all. The regression arrived with the
+publication, and it was in the seventeenth log too, four times, unread.
+
+**Two corrections, and both of them are the analyzer's as much as the engine's.**
+
+*The check passed a run the user was looking at an error dialog in.* `paths` matched
+`statfs(<path>) failed: …` — a system library reporting an errno — and nothing else. An
+app's own engine does not say that; Unity says `Unable to open '<path>'`. Both spellings
+are read now, runs 17 and 18 fail the check, and `docs/STATUS.md`'s claim that run 17
+passed everything but `google` is retracted here.
+
+*And the gate that decides whether to publish asks a library that is not the one at risk.*
+`File.isFile()` reaches `libopenjdk.so`, which the redirect covers. The caller that failed
+was the guest's own, which it did not.
+
+**Why it did not, checked against bionic rather than reasoned about.**
+
+1. **`__open_2`.** A release build's two-argument `open(path, O_RDONLY)` does not call
+   `open`. The NDK enables `_FORTIFY_SOURCE` at every optimisation level, and bionic's
+   `bits/fortify/fcntl.h` turns that call into `__open_2` — a *different symbol*, which the
+   redirect table did not have. What it did have was `__openat`, which bionic does not
+   export at all, so it could never match anything and reported as a symbol nothing
+   imports. `llvm-readelf --dyn-syms` on the NDK's own `libc.so` settles both:
+   `__open_2`, `__openat_2`, `__readlink_chk` and `__readlinkat_chk` exist; `__openat`
+   does not. All four are in the table now, with their own trampolines, and
+   `tools/native-test/check_libc_symbols.py` checks every name in it against that same
+   `libc.so` — the check that would have caught this, and which skips with a message on a
+   machine with no NDK.
+
+2. **The library-load watch was never re-armed.** It hooks `dlopen` in the libraries
+   loaded when it is installed. `System.loadLibrary` goes through `libnativeloader.so`,
+   which was — but `libmain.so` pulls in `libunity.so` by `dlopen`ing it *itself*, and
+   `libmain.so`'s own `dlopen` slot was never patched, so no rescan ran. The eighteenth log
+   contains no rescan for `libunity.so` at all; the seventeenth contains one, 1.7 seconds
+   before Unity failed anyway, which is what proves the two faults are separate.
+   `rescan_after_load` re-arms the watch as well as the redirect now.
+
+The per-library line also names a guest's own library that patched **nothing**
+(`libunity.so=0+packed`), because "never scanned" and "scanned and matched no symbol" are
+a missing rescan and a missing symbol respectively, and they printed the same absence.
 
 ### Signing in: the refusal happens before the account picker, and that is measurable
 

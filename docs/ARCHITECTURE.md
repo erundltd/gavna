@@ -1275,6 +1275,44 @@ name this build's table does not have — leaves SQLite exactly as it was and is
 facts and a slot count only answers the first. The `+packed` marker on the per-library line
 states the premise so a later run can retract it.
 
+### 7.3.0.1 The two ways a hook reports success and reaches nothing
+
+Both were found by the eighteenth phone run, both had been in place for several builds, and
+both printed exactly what a healthy configuration prints.
+
+**A symbol name that is not a symbol.** The NDK enables `_FORTIFY_SOURCE` at every
+optimisation level, so a two-argument `open(path, O_RDONLY)` in any release build does not
+call `open`: bionic's `bits/fortify/fcntl.h` turns it into **`__open_2`**, a different
+symbol with a different signature. The table did not have it. It had `__openat`, which
+bionic does not export at all — a name written from memory — and a name nothing exports
+looks, in the one diagnostic that could have said so, exactly like a name this process
+happens not to use:
+
+```
+io_redirect: nothing in this process imports: __openat, open64, creat64, …
+```
+
+`open64` and `creat64` are real. `__openat` never was. The cost was a game handed an
+installed-shaped path for its own APK that its own engine could not open — Unity printing
+`ApkAddCentralDirectory : Unable to open '/data/app/~~…/base.apk'` and telling its player
+the device was out of storage. `tools/native-test/check_libc_symbols.py` reads every name
+out of the table and checks it against the NDK's own `libc.so`; it skips with a message on
+a machine without one, because the rest of that suite needs no Android toolchain.
+
+**A watch armed once.** The library-load watch hooks `dlopen` and `android_dlopen_ext` in
+the libraries loaded at the moment it is installed. `System.loadLibrary` reaches the linker
+through `libnativeloader.so`, which is one of them — but a library that then `dlopen`s
+another *itself* is not, and its call is invisible. Unity is exactly that shape:
+`libmain.so` arrives through the loader and pulls in `libunity.so` on its own. So the
+rescan after a load re-arms the watch as well as the redirect, and the "watch installed"
+flag is sticky, because a pass that walks only libraries it has already seen patches
+nothing and must not be read as a failed one.
+
+The per-library line names a guest's own library that patched **nothing**
+(`libunity.so=0+packed`) for the same reason: "never scanned" and "scanned and matched no
+symbol" are a missing rescan and a missing symbol, and until this they printed the same
+absence.
+
 ### 7.3.1 The inverse table: what `/proc` says about all of it
 
 Redirection covers the paths a guest **hands out**. It does nothing about the ones a guest

@@ -106,6 +106,9 @@ bool installed() { return g_installed; }
 // the trampolines becomes ambiguous rather than resolving to the real one.
 InstallStatus install_locked();
 
+/// Installs (or extends) the library-load watch. Idempotent; see watch_library_loads().
+InstallStatus watch_locked();
+
 namespace {
 
 // Originals, filled by the PLT hook. Null until install() runs, and every trampoline
@@ -138,6 +141,14 @@ int (*o_statfs)(const char*, struct statfs*) = nullptr;
 // A relative path with a real `dirfd` is left alone by construction: the redirect table
 // only matches paths beginning with `/`.
 int (*o_fstatat)(int, const char*, struct stat*, int) = nullptr;
+
+// The fortified spellings. Separate originals, because they are separate symbols with
+// separate addresses and calling one through the other's saved pointer would pass the
+// wrong number of arguments.
+int (*o_open_2)(const char*, int) = nullptr;
+int (*o_openat_2)(int, const char*, int) = nullptr;
+ssize_t (*o_readlink_chk)(const char*, char*, size_t, size_t) = nullptr;
+ssize_t (*o_readlinkat_chk)(int, const char*, char*, size_t, size_t) = nullptr;
 int (*o_faccessat)(int, const char*, int, int) = nullptr;
 int (*o_mkdirat)(int, const char*, mode_t) = nullptr;
 int (*o_unlinkat)(int, const char*, int) = nullptr;
@@ -383,6 +394,82 @@ int h_fstatat(int dirfd, const char* path, struct stat* out, int flags) {
                                 : ::fstatat(dirfd, target, out, flags);
 }
 
+// The fortified spellings, which are what an app compiled with `_FORTIFY_SOURCE` calls
+// and are *different symbols* from the ones they fortify.
+//
+// `open(path, O_RDONLY)` in a release build does not emit a call to `open`. Bionic's
+// `bits/fortify/fcntl.h` turns a two-argument open into `__open_2(path, flags)`, and
+// `openat` into `__openat_2`. The NDK enables `_FORTIFY_SOURCE` at every optimisation
+// level, so this is not an edge case — it is what most third-party native code does.
+//
+// The eighteenth phone run is what this cost. Standoff 2's `libunity.so` was hooked, in
+// the same process, 1.7 seconds before it tried and failed to open the APK path UNIQUE
+// had just published to it:
+//
+//   io_redirect: hooked libunity.so=2
+//   E Unity: ApkAddCentralDirectory : Unable to open '/data/app/~~kx_uUO…/base.apk'
+//   E Unity: Failed to read assets/bin/Data/unity_app_guid
+//
+// and the game told its player "Not enough storage space to install required resources",
+// because from its point of view its own APK was gone. Two patched slots in a 236 MB
+// library was the whole tell, and the table's `__openat` — a name bionic does not export
+// at all, so it could never match anything — was the other.
+//
+// `__open_2` cannot carry a mode: bionic rejects a two-argument open with `O_CREAT` at
+// compile time, which is the entire reason the fortified form exists. So these take the
+// arguments they are actually called with rather than being varargs.
+int h_open_2(const char* path, int flags) {
+    const int served = serve_proc(path, (flags & O_CLOEXEC) != 0);
+    if (served >= 0) return served;
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    return o_open_2 != nullptr ? o_open_2(target, flags) : ::open(target, flags);
+}
+
+int h_openat_2(int dirfd, const char* path, int flags) {
+    const int served = serve_proc(path, (flags & O_CLOEXEC) != 0);
+    if (served >= 0) return served;
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    return o_openat_2 != nullptr ? o_openat_2(dirfd, target, flags)
+                                 : ::openat(dirfd, target, flags);
+}
+
+/// Rewrites a `readlink` answer through the outward view. Shared by all four spellings.
+ssize_t view_readlink_result(char* buf, ssize_t n, size_t size) {
+    if (n <= 0 || buf == nullptr) return n;
+    std::string shown;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_proc_view.empty()) return n;
+        if (!g_proc_view.rewrite_path(buf, static_cast<size_t>(n), shown)) return n;
+    }
+    const size_t copied = shown.size() < size ? shown.size() : size;
+    std::memcpy(buf, shown.data(), copied);
+    return static_cast<ssize_t>(copied);
+}
+
+ssize_t h_readlink_chk(const char* path, char* buf, size_t size, size_t buf_size) {
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    const ssize_t n = o_readlink_chk != nullptr
+            ? o_readlink_chk(target, buf, size, buf_size)
+            : (o_readlink != nullptr ? o_readlink(target, buf, size)
+                                     : ::readlink(target, buf, size));
+    return view_readlink_result(buf, n, size);
+}
+
+ssize_t h_readlinkat_chk(int dirfd, const char* path, char* buf, size_t size,
+                         size_t buf_size) {
+    std::string holder;
+    const char* target = rewrite(path, holder);
+    const ssize_t n = o_readlinkat_chk != nullptr
+            ? o_readlinkat_chk(dirfd, target, buf, size, buf_size)
+            : (o_readlinkat != nullptr ? o_readlinkat(dirfd, target, buf, size)
+                                       : ::readlinkat(dirfd, target, buf, size));
+    return view_readlink_result(buf, n, size);
+}
+
 int h_faccessat(int dirfd, const char* path, int mode, int flags) {
     std::string holder;
     const char* target = rewrite(path, holder);
@@ -525,6 +612,17 @@ void rescan_after_load(const char* what) {
     t_rescanning = true;
     const int before = g_slots_patched;
     install_locked();
+    // And the *watch* itself, on the library that has just arrived.
+    //
+    // Without this the watch covers only what was loaded when it was installed. A library
+    // loaded through `System.loadLibrary` is seen, because that goes through
+    // `libnativeloader.so`, which was — but a library that library then `dlopen`s itself
+    // is not, because its own `dlopen` slot was never patched.
+    //
+    // Unity is exactly that shape: `libmain.so` arrives through the loader and pulls in
+    // `libunity.so` itself. The eighteenth phone run has no rescan for `libunity.so` at
+    // all, and the game could not open the APK path UNIQUE had published to it.
+    watch_locked();
     const int added = g_slots_patched - before;
     if (added > 0) {
         ULOGI("io_redirect: hooked %d new slot(s) after loading %s (%d total)",
@@ -646,9 +744,19 @@ InstallStatus install_locked() {
         {"statvfs",     reinterpret_cast<void*>(h_statvfs),     reinterpret_cast<void**>(&o_statvfs)},
         {"statvfs64",   reinterpret_cast<void*>(h_statvfs),     reinterpret_cast<void**>(&o_statvfs)},
 
-        // `__openat` and `__open_2` are bionic's fortified spellings, emitted when a
-        // library is built with `_FORTIFY_SOURCE`. Most of the platform is.
-        {"__openat",    reinterpret_cast<void*>(h_openat),       reinterpret_cast<void**>(&o_openat)},
+        // Bionic's fortified spellings, emitted when a library is built with
+        // `_FORTIFY_SOURCE` — which the NDK turns on at every optimisation level, so most
+        // third-party native code is. These are *different symbols*, not aliases.
+        //
+        // `__openat` used to stand here and does not exist: bionic exports `__open_2` and
+        // `__openat_2`, and nothing in any process has ever imported the name that was
+        // asked for. It was invisible because "nothing imports this" and "this name is
+        // not a symbol" print the same line. `tools/native-test/check_libc_symbols.py`
+        // now checks every name in this table against the NDK's own `libc.so`.
+        {"__open_2",    reinterpret_cast<void*>(h_open_2),       reinterpret_cast<void**>(&o_open_2)},
+        {"__openat_2",  reinterpret_cast<void*>(h_openat_2),     reinterpret_cast<void**>(&o_openat_2)},
+        {"__readlink_chk",   reinterpret_cast<void*>(h_readlink_chk),   reinterpret_cast<void**>(&o_readlink_chk)},
+        {"__readlinkat_chk", reinterpret_cast<void*>(h_readlinkat_chk), reinterpret_cast<void**>(&o_readlinkat_chk)},
 
         // The large-file spellings, which are a different *symbol* and were the whole of
         // the sixteenth run's failure.
@@ -827,10 +935,10 @@ InstallStatus install() { return install_locked(); }
  *
  * The guest's own libraries are hooked too, so a native plugin loader is covered as well.
  */
-InstallStatus watch_library_loads() {
-    if (g_watching) return InstallStatus::kOk;
+InstallStatus watch_library_loads() { return watch_locked(); }
 
-    plt::HookRequest requests[] = {
+InstallStatus watch_locked() {
+    static plt::HookRequest requests[] = {
         {"android_dlopen_ext", reinterpret_cast<void*>(h_android_dlopen_ext),
          reinterpret_cast<void**>(&o_android_dlopen_ext)},
         {"dlopen", reinterpret_cast<void*>(h_dlopen), reinterpret_cast<void**>(&o_dlopen)},
@@ -853,12 +961,21 @@ InstallStatus watch_library_loads() {
     static const std::vector<std::string> none;
     auto report = plt::hook_all(scope, none, none, requests,
                                 sizeof(requests) / sizeof(requests[0]), seen);
-    g_watching = report.slots_patched > 0;
-    ULOGI("io_redirect: library-load watch %s (%d slot(s) in %d libraries)",
-          g_watching ? "installed" : "found nothing to hook",
-          report.slots_patched, report.libraries_matched);
-    for (const auto& name : report.sample) {
-        ULOGW("io_redirect: watch saw but did not match: %s", name.c_str());
+    // Sticky, and it has to be: this runs again after every library load, and a pass that
+    // walks only libraries it has already seen patches nothing. Reading that as "the watch
+    // is not installed" would be the same mistake `kNothingToHook` was added to stop.
+    const bool armed_now = report.slots_patched > 0;
+    g_watching = g_watching || armed_now;
+    // One line per pass that changed something, so a hundred quiet re-arms cost nothing
+    // and the first one — or a later one that reaches a library the first could not — is
+    // still in the log.
+    if (armed_now || !g_watching) {
+        ULOGI("io_redirect: library-load watch %s (%d slot(s) in %d libraries)",
+              g_watching ? "installed" : "found nothing to hook",
+              report.slots_patched, report.libraries_matched);
+        for (const auto& name : report.sample) {
+            ULOGW("io_redirect: watch saw but did not match: %s", name.c_str());
+        }
     }
     // Not kNothingToHook: the scope here is libnativeloader.so and libart.so, which are
     // loaded in every process there has ever been. Matching nothing means the hook did

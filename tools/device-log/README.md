@@ -205,14 +205,14 @@ only affects the header line.
 tools/device-log/self_test.py
 ```
 
-92 tests, under a second, no dependencies. Three kinds:
+97 tests, under a second, no dependencies. Three kinds:
 
 - **`fixtures/redmi-android15.log`** — a real run on a Redmi Note 12, Android 15, ARM64:
   the run in which no app launched. Every finding asserted against it is something that
   happened to a real phone, so a check that stops reporting one has regressed. It is the
   full run filtered to the lines that carry evidence (941 of 26,950); the verdicts are
   identical to those from the unfiltered log.
-- **`fixtures/redmi-android15-run4.log` … `-run13.log`** — the runs after it,
+- **`fixtures/redmi-android15-run4.log` … `-run14.log`** — the runs after it,
   each filtered the same way. Every fault a run found has an assertion here, so a check
   that stops reporting one is a regression in the tool rather than progress in the
   engine. The sixth is the run in which six of seven apps launched and the games could
@@ -241,7 +241,11 @@ tools/device-log/self_test.py
   two things: `leaked=0` on the same phone and the same game, and a bug in *this tool* —
   it reported "Google answered `DEVELOPER_ERROR`" on a run where the only line containing
   the word was UNIQUE's own prediction of what would happen. An assertion now pins that
-  the forecast is not read as the answer.
+  the forecast is not read as the answer. The fourteenth is the first with installed-shaped
+  paths in it, and it is kept because it contains both halves of what that cost: the data
+  gate refusing with SQLite's own diagnosis attached, and a published code path that a
+  system library outside the hook's scope could not open. The `paths` check is written
+  against it.
 - **A synthetic healthy run** — every check must pass on it. Without that the suite would
   prove only that the tool says FAIL, which a tool that always says FAIL would also
   pass.

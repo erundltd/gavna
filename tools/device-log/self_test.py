@@ -52,6 +52,8 @@ FIXTURE12 = os.path.join(HERE, "fixtures", "redmi-android15-run12.log")
 FIXTURE12_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run12.device.txt")
 FIXTURE13 = os.path.join(HERE, "fixtures", "redmi-android15-run13.log")
 FIXTURE13_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run13.device.txt")
+FIXTURE14 = os.path.join(HERE, "fixtures", "redmi-android15-run14.log")
+FIXTURE14_DEVICE = os.path.join(HERE, "fixtures", "redmi-android15-run14.device.txt")
 
 
 def findings(check: analyze.Check) -> str:
@@ -849,6 +851,90 @@ class RedmiRun13Test(unittest.TestCase):
             if check.verdict == analyze.FAIL
         )
         self.assertEqual(failing, ["google"])
+
+
+class RedmiRun14Test(unittest.TestCase):
+    """The fourteenth run: the first with installed-shaped paths, and it found the cost.
+
+    Two things this log settles, and neither could have been settled anywhere else.
+
+    **The gate worked.** The data half of the identity swap is applied only after a probe
+    writes through the published path and finds the result at the real one. It refused,
+    named itself, and nothing was lost:
+
+    ```
+    GUEST_PATHS_PUBLISHED package=com.axlebolt.standoff2 code=true data=false
+        detail=a database cannot be opened through the public path:
+               SQLiteDiskIOException: disk I/O error (code 1802 SQLITE_IOERR_FSTAT)
+    ```
+
+    with SQLite's own diagnosis two lines above it:
+
+    ```
+    W SQLiteLog: (28) file renamed while open:
+        /data/data/com.axlebolt.standoff2/databases/.unique-path-probe.db
+    ```
+
+    SQLite opened the database through the redirect and then could not find it at the path
+    it had been given. The cause is in `plt_hook.cpp`: SQLite wraps `open` in a local
+    function, which goes through the PLT, but stores `stat` and `lstat` *by address* in a
+    static table, which is an absolute data relocation the hook did not patch. Its `lstat`
+    reaching the real filesystem is also why the path in that message has `/data/user/0`
+    resolved to `/data/data` — a rewriting no rule of UNIQUE's produces.
+
+    **The code half was published, and cost something.** This is the finding that matters:
+
+    ```
+    E misc: isReadonlyFilesystem():
+        statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk) failed:
+        No such file or directory
+    ```
+
+    A system library nobody had listed read the published `sourceDir` and could not open
+    it, because it was outside the hook's three-library scope. A path handed to a guest is
+    handed to every library in its process. That is what turned the scope process-wide, and
+    it is why the `paths` check exists.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parsed = analyze.load(FIXTURE14, FIXTURE14_DEVICE)
+        cls.checks = {c.name: c for c in analyze.run_checks(cls.parsed)}
+
+    def test_a_published_path_that_did_not_resolve_is_a_failure(self):
+        # The whole point of the check. Publishing a path that works for some callers and
+        # not others is worse than publishing nothing, and it arrives as the guest's bug.
+        detail = findings(self.checks["paths"])
+        self.assertIn("did not resolve", detail)
+        # The tag of the library that could not open it, so the finding names a caller
+        # rather than a shape. `misc` is a system library, not the guest's own.
+        self.assertIn("for misc:", detail)
+        self.assertIn("/data/app/~~", detail)
+        self.assertIn("No such file or directory", detail)
+        # And it must be matched against what this run actually published, not against a
+        # pattern: a `/data/app/...` path from any other app is not this check's business.
+        self.assertIn("com.axlebolt.standoff2-", detail)
+
+    def test_the_probe_refusing_is_reported_and_is_not_a_failure(self):
+        # `data=false` is the gate doing its job, not a regression. Reporting it as a
+        # failure would train the reader to ignore the one line that says what refused.
+        text = notes(self.checks["paths"])
+        self.assertIn("data paths held back", text)
+        self.assertIn("SQLITE_IOERR_FSTAT", text)
+
+    def test_the_engine_itself_did_not_regress(self):
+        for name in ("launch", "slots", "crash", "platform", "detection", "native", "hooks"):
+            self.assertEqual(self.checks[name].verdict, analyze.PASS, name)
+
+    def test_the_proc_view_still_leaks_nothing_for_both_guests(self):
+        # Two apps in this run, including one the view had never covered before.
+        text = notes(self.checks["detection"])
+        self.assertIn("com.axlebolt.standoff2", text)
+        self.assertIn("com.openai.chatgpt", text)
+        self.assertNotIn("still name UNIQUE", findings(self.checks["detection"]))
+
+    def test_unique_s_own_forecast_is_still_not_reported_as_google_s_answer(self):
+        self.assertIn("never answered DEVELOPER_ERROR", notes(self.checks["google"]))
 
 
 HEALTHY = """\

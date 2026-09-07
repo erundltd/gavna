@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
@@ -26,12 +27,48 @@ using Sym = ElfW(Sym);
 #if defined(__aarch64__)
 constexpr unsigned kJumpSlot = R_AARCH64_JUMP_SLOT;
 constexpr unsigned kGlobDat = R_AARCH64_GLOB_DAT;
+constexpr unsigned kAbs64 = R_AARCH64_ABS64;
 #elif defined(__x86_64__)
 constexpr unsigned kJumpSlot = R_X86_64_JUMP_SLOT;
 constexpr unsigned kGlobDat = R_X86_64_GLOB_DAT;
+constexpr unsigned kAbs64 = R_X86_64_64;
 #else
 #error "Unsupported architecture for PLT hooking."
 #endif
+
+/// True for a relocation whose slot holds the address of the symbol and nothing else.
+///
+/// The first two are the obvious ones: a call through the PLT and a GOT read. The third
+/// is the one that cost a build.
+///
+/// A library that takes the *address* of a libc function in a static initialiser gets
+/// neither. It gets an absolute data relocation, which the linker resolves once at load
+/// time by writing libc's address into that library's own `.data.rel.ro` — and every
+/// later call reads it from there without touching the GOT. SQLite is built exactly that
+/// way:
+///
+/// ```c
+/// static struct unix_syscall {
+///   const char *zName; sqlite3_syscall_ptr pCurrent; ...
+/// } aSyscall[] = {
+///   { "open",  (sqlite3_syscall_ptr)posixOpen, 0 },   /* a wrapper -> goes through PLT */
+///   { "stat",  (sqlite3_syscall_ptr)stat,      0 },   /* the address -> does not      */
+///   { "lstat", (sqlite3_syscall_ptr)lstat,     0 },
+/// ```
+///
+/// So `open` was redirected and `stat` was not, in the same library, and the fourteenth
+/// phone log said so precisely: SQLite opened the database in the instance, then looked
+/// for it at the path it had been given, did not find it, and reported
+/// `file renamed while open` followed by a disk I/O error. Its `lstat` reaching the real
+/// filesystem is also why the path in that message had resolved `/data/user/0` to
+/// `/data/data`, which no rule of UNIQUE's produces.
+///
+/// The addend has to be zero. `S + A` with a non-zero addend is a pointer *into* the
+/// function, not to it, and replacing that would be replacing something else entirely.
+bool is_address_slot(unsigned type, ElfW(Sxword) addend) {
+    if (type == kJumpSlot || type == kGlobDat) return true;
+    return type == kAbs64 && addend == 0;
+}
 
 std::mutex g_mutex;
 
@@ -114,15 +151,42 @@ struct ScanContext {
     HookRequest* requests;
     size_t request_count;
     HookReport* report;
+    std::vector<std::string>* seen;
+    /// Slots patched in the library currently being walked.
+    int here = 0;
 };
 
 bool path_matches(const char* path, const std::vector<std::string>& filters) {
     if (filters.empty()) return true;
+    for (const auto& filter : filters) {
+        // The whole process, asked for explicitly. An empty filter list still means
+        // "everything" for the same reason it always did, but nothing calls it that way:
+        // a scope that was left unset by mistake and one that was widened on purpose
+        // produce the same behaviour and must not produce the same log line.
+        if (filter == "*") return true;
+    }
     if (path == nullptr) return false;
     for (const auto& filter : filters) {
         if (strstr(path, filter.c_str()) != nullptr) return true;
     }
     return false;
+}
+
+/// Libraries a previous pass already walked, so a re-scan only looks at what is new.
+///
+/// The scan runs again on every library load. With a scope of three libraries that cost
+/// nothing; with the whole process in scope it is four hundred libraries' relocation
+/// tables against every symbol in the table, on the thread that is loading a library,
+/// and a game loads dozens.
+///
+/// Keyed on name *and* load address: the same library re-scanned is a skip, and a
+/// different library that happens to land where an unloaded one used to is not.
+///
+/// Owned by the caller, one per set of requests. See `hook_all`.
+std::string library_key(const char* path, ElfW(Addr) base) {
+    char suffix[32];
+    std::snprintf(suffix, sizeof(suffix), "@%llx", static_cast<unsigned long long>(base));
+    return std::string(path == nullptr ? "" : path) + suffix;
 }
 
 /// True when an exclusion names this library. An empty list excludes nothing.
@@ -140,7 +204,7 @@ void patch_relocations(const Rela* rela, size_t count, const DynamicInfo& info,
 
     for (size_t i = 0; i < count; ++i) {
         const unsigned type = UNIQUE_R_TYPE(rela[i].r_info);
-        if (type != kJumpSlot && type != kGlobDat) continue;
+        if (!is_address_slot(type, rela[i].r_addend)) continue;
 
         const auto sym_index = UNIQUE_R_SYM(rela[i].r_info);
         const char* name = info.strtab + info.symtab[sym_index].st_name;
@@ -149,6 +213,7 @@ void patch_relocations(const Rela* rela, size_t count, const DynamicInfo& info,
         for (size_t r = 0; r < ctx->request_count; ++r) {
             HookRequest& request = ctx->requests[r];
             if (strcmp(name, request.symbol) != 0) continue;
+            request.matched = true;
 
             auto slot = reinterpret_cast<void**>(base + rela[i].r_offset);
             if (*slot == request.replacement) break;   // already ours; idempotent
@@ -175,6 +240,7 @@ void patch_relocations(const Rela* rela, size_t count, const DynamicInfo& info,
                                     : previous;
                 }
                 ctx->report->slots_patched++;
+                ctx->here++;
             } else {
                 ctx->report->failures.emplace_back(std::string("mprotect failed for ") + name);
             }
@@ -208,6 +274,16 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
     }
     ctx->report->libraries_matched++;
 
+    const std::string key = library_key(info->dlpi_name, info->dlpi_addr);
+    for (const auto& seen : *ctx->seen) {
+        if (seen == key) {
+            ctx->report->libraries_already_scanned++;
+            return 0;
+        }
+    }
+    ctx->seen->push_back(key);
+
+    ctx->here = 0;
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         const ElfW(Phdr)& phdr = info->dlpi_phdr[i];
         if (phdr.p_type != PT_DYNAMIC) continue;
@@ -218,6 +294,13 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
         patch_relocations(dynamic.rela, dynamic.rela_count, dynamic,
                           info->dlpi_addr, ctx);
     }
+    if (ctx->here > 0 && ctx->report->per_library.size() < 24) {
+        const char* name = info->dlpi_name;
+        const char* base = (name == nullptr) ? "" : strrchr(name, '/');
+        ctx->report->per_library.emplace_back(
+                std::string(base != nullptr ? base + 1 : (name == nullptr ? "?" : name)) +
+                "=" + std::to_string(ctx->here));
+    }
     return 0;
 }
 
@@ -225,10 +308,11 @@ int scan_one(struct dl_phdr_info* info, size_t, void* data) {
 
 HookReport hook_all(const std::vector<std::string>& path_filters,
                     const std::vector<std::string>& path_excludes,
-                    HookRequest* requests, size_t request_count) {
+                    HookRequest* requests, size_t request_count,
+                    std::vector<std::string>& seen) {
     std::lock_guard<std::mutex> lock(g_mutex);
     HookReport report;
-    ScanContext ctx{&path_filters, &path_excludes, requests, request_count, &report};
+    ScanContext ctx{&path_filters, &path_excludes, requests, request_count, &report, &seen};
     dl_iterate_phdr(scan_one, &ctx);
     return report;
 }

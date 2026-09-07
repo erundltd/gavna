@@ -79,11 +79,27 @@ object GuestNativeExclusions {
         // again with the exclusion in place. See the class comment.
         "libgrave.so",
 
-        // UNIQUE's own. It is inside the guest's process and outside the scope filter
-        // today, but the scope is a substring match on directories and a guest that ever
-        // ships a library under a similarly-named path would drag it in. Hooking our own
-        // libc calls would redirect the redirector.
+        // UNIQUE's own. The scope is the whole process now, so this is no longer
+        // hypothetical: without the entry, the redirector's own libc calls would go
+        // through the redirector.
         "libunique_native.so",
+
+        // The dynamic linker and the three libraries it is built out of.
+        //
+        // These are excluded for a different reason from the protector above, and it is
+        // not caution. A GOT slot in `libc.so` is one libc reads to call *itself*, and a
+        // trampoline that runs inside libc's own implementation of `fopen` on its way to
+        // `open` would redirect a path that was already redirected on the way in — twice
+        // is not idempotent for a prefix rewrite. The linker is worse: it resolves the
+        // symbols the trampoline itself needs.
+        //
+        // Nothing is lost by it. A guest never calls into libc's internals with a path of
+        // its own; it calls libc's exported entry points, and those are hooked in the
+        // caller's library, which is where the path actually comes from.
+        "/linker64",
+        "/libc.so",
+        "/libdl.so",
+        "/libm.so",
     )
 
     /**

@@ -1039,39 +1039,48 @@ object AppBootstrap {
     }
 
     /**
-     * The platform's own libraries through which a guest's **Java** file operations pass.
+     * Every library in the guest's process, minus the exclusions.
      *
-     * Until this list existed the interception was scoped to the guest's own `.so` files,
-     * which is the right scope for a guest's *native* code and covers none of its Java.
-     * `new FileOutputStream(...)`, `File.exists()`, every `SharedPreferences` write and
-     * every `SQLiteDatabase` open in the process go through `libcore.io.Linux`, whose
-     * native half is `libjavacore.so` — so a guest that hard-coded `/sdcard/…` in Java
-     * wrote to the device's real shared storage, and one that hard-coded
-     * `/data/data/<pkg>/…` wrote nowhere at all.
+     * ## Three scopes, and why only the third can work
      *
-     * ## Why widening it is safe, which is the only reason to do it
+     * It was the guest's own `.so` files, which is the right scope for a guest's *native*
+     * code and covers none of its Java. It was then those plus `libjavacore.so`,
+     * `libsqlite.so` and `libandroid_runtime.so`, which covers a guest's Java file IO —
+     * `File`, every stream, every `SharedPreferences` write, every database.
+     *
+     * The fourteenth phone run ended both. With the guest reporting an installed-shaped
+     * `sourceDir`, a system library nobody had listed read it:
+     *
+     * ```
+     * E misc: isReadonlyFilesystem():
+     *     statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk) failed:
+     *     No such file or directory
+     * ```
+     *
+     * A path handed to a guest is handed to **every library in the guest's process**, and
+     * any of them may be the one that opens it. Publishing such a path while hooking part
+     * of the process is worse than publishing nothing: the path works for some callers and
+     * not others, and the failure arrives as the guest's own bug — which is exactly how it
+     * arrived, as a game reporting that the device was out of space.
+     *
+     * ## Why the wide scope is safe, which is a property of the table
      *
      * A hook that redirects is only as dangerous as the table it applies. Every rule in
      * `VirtualPathModel.redirectionRules` names either the **guest's** package
-     * (`/data/data/<guest>`, `/data/user/0/<guest>`, `/data/app/<guest>`, the instance's
+     * (`/data/data/<guest>`, `/data/user/0/<guest>`, `/data/app/…<guest>…`, the instance's
      * public APK directory) or a shared-storage alias (`/sdcard`, `/storage/emulated/0`,
-     * `/storage/self/primary`, `/mnt/sdcard`). **None of them can match a path under
-     * `/data/user/0/com.unique`**, so UNIQUE's own file operations in the same process —
-     * its diagnostics, its runtime state, the instance directories it creates — pass
-     * through untouched no matter which library makes them.
+     * `/storage/self/primary`, `/mnt/sdcard`). **None can match a path under
+     * `/data/user/0/com.unique`**, so UNIQUE's own file operations pass through untouched
+     * no matter which library makes them — asserted by name in `round_trip_test.cpp`
+     * against UNIQUE's own preferences, database, diagnostics and installed APK.
      *
-     * That is a property of the table rather than of the scope, and it is what makes the
-     * difference between this and "redirect every file operation in the process", which
-     * `set_scope` still refuses to do.
+     * So the hook being everywhere is not the redirect being everywhere. It is the table
+     * being asked in every library instead of three, and the table is what decides.
      *
-     * `libsqlite.so` is here because a database is opened by absolute path from
-     * `libandroid_runtime.so`, and neither of those is `libjavacore.so`.
+     * The linker, `libc.so`, `libdl.so`, `libm.so` and UNIQUE's own native library are
+     * excluded — see `GuestNativeExclusions` for why each, and why nothing is lost by it.
      */
-    private val PLATFORM_IO_LIBRARIES = listOf(
-        "libjavacore.so",
-        "libsqlite.so",
-        "libandroid_runtime.so",
-    )
+    private val REDIRECT_SCOPE = listOf("*")
 
     /** What [armIoRedirection] published, so [installIoRedirection] can report it. */
     private data class Armed(
@@ -1125,10 +1134,7 @@ object AppBootstrap {
                     abiDirName = appInfo.nativeLibraryDir?.substringAfterLast('/') ?: "arm64-v8a",
                 )
             }.getOrDefault(emptyList())
-            val scope = listOfNotNull(
-                appInfo.nativeLibraryDir,
-                appInfo.sourceDir?.substringBeforeLast('/'),
-            ).filter { it.isNotBlank() }.flatMap(::pathAliases).distinct() + PLATFORM_IO_LIBRARIES
+            val scope = REDIRECT_SCOPE
             UniqueNative.setRedirectScope(scope)
             // Set before install, never after: install() walks what is loaded now, and an
             // exclusion that arrives afterwards excludes a library that is already hooked.
@@ -1378,31 +1384,6 @@ object AppBootstrap {
             ),
         )
         return candidate
-    }
-
-    /**
-     * The same directory under every name the platform might report it as.
-     *
-     * `/data/data/<host>` and `/data/user/0/<host>` are the same directory: the first is
-     * a symlink kept for compatibility, and which one appears depends on who resolved the
-     * path. `Context.getFilesDir()` hands back the `/data/user/0` form, while the dynamic
-     * linker recorded the library it opened as:
-     *
-     * ```
-     * /data/data/com.unique/files/virtual/apk/com.unique.probe/28/lib/x86_64/libprobenative.so
-     * ```
-     *
-     * so a scope built from the first never matched the second and nothing was hooked -
-     * with the library plainly loaded and the filter plainly correct-looking. Matching
-     * both is the fix; the diagnostic that prints the filter next to the library names it
-     * did not match is what made it a two-minute problem instead of a long one.
-     */
-    private fun pathAliases(path: String): List<String> = when {
-        path.startsWith("/data/user/0/") ->
-            listOf(path, path.replaceFirst("/data/user/0/", "/data/data/"))
-        path.startsWith("/data/data/") ->
-            listOf(path, path.replaceFirst("/data/data/", "/data/user/0/"))
-        else -> listOf(path)
     }
 
     /**

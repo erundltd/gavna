@@ -64,6 +64,104 @@ install over them.
 
 ## What changed since the last phone run
 
+Your log was the most useful one this project has had, and not because things worked. Both
+of the safety checks I built into the last build fired, and one of them was right to.
+
+**The safe half worked exactly as designed.** Before telling an app its data folder is
+`/data/user/0/<app>`, UNIQUE writes a byte through that path and checks it arrives where it
+should. It did not, so the data folder was left alone and nothing was lost:
+
+```
+GUEST_PATHS_PUBLISHED … code=true data=false
+    detail=a database cannot be opened through the public path
+```
+
+The reason is a genuinely interesting bug and your log contained the whole diagnosis.
+UNIQUE redirects an app's file access by rewriting a pointer in each library's jump table.
+That catches every *call*. It does not catch a library that takes the *address* of a system
+function once, at load, and stores it — and Android's SQLite does precisely that for `stat`
+and `lstat` while going through the normal route for `open`. So inside one library half the
+file calls were redirected and half were not, SQLite opened the database in one place and
+looked for it in another, and said so. Fixed: those stored addresses are patched too, and
+there is now a test that compiles the same construct and checks the compiler still produces
+what the fix assumes.
+
+**The unsafe half is the one that caused what you saw.** The "not enough memory" message in
+Standoff 2 is almost certainly this line, which your log has three times:
+
+```
+E misc: isReadonlyFilesystem():
+    statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-…/base.apk) failed:
+    No such file or directory
+```
+
+I told the game its APK is at an installed-looking path, and made that path work for the
+libraries I had hooked — but not for the rest of the system. One library I had not thought
+about read the path, could not open it, and the game reported it as a storage problem.
+
+That was my mistake and the fix is the obvious one once it is stated plainly: **a path
+handed to an app is handed to every library in that app's process**, so the redirect has to
+cover all of them. It now does — every library except the linker, the C library itself and
+UNIQUE's own. That is a big change, and the reason it is safe is not that I was careful: it
+is that the redirect rules can only ever match the *guest's* own folder names or the shared
+storage folders, never UNIQUE's, and there is a test that checks exactly that against
+UNIQUE's own settings, database and logs by name.
+
+I also added the gate that was missing: the app is not told about an installed-looking path
+unless the redirect is actually in place and the path actually opens.
+
+**And the log tool now reads all of this.** A new `paths` check reports a gate refusing as
+information — that is the design working — and *fails* on a published path that some caller
+could not open. That distinction is the whole lesson from your log.
+
+### About Google sign-in, since you asked
+
+Short answer: **not through your phone's own Play services. Ever. And there is exactly one
+route that could work, which is not built yet.** The long answer is
+[`docs/GOOGLE_SIGN_IN.md`](../docs/GOOGLE_SIGN_IN.md); the essentials:
+
+Google identifies an app by **package name and signing certificate**, and it does not take
+the app's word for either — it asks Android, using the process id of whoever called. Inside
+UNIQUE that process is UNIQUE. That is why the "unknown calling package" errors were fixable
+(UNIQUE now tells Play services the truth, that the caller is UNIQUE) and why sign-in is
+not: telling the truth there means asking Google for a token for UNIQUE, which has no
+account with the game's server.
+
+There is no hook, no permission and no setting that changes this. It happens in another
+process, against records Android keeps, on a phone with no root.
+
+**The one route that would work** is to run Play services *inside* the virtual space, as
+another virtual app. Then the process asking "who is calling?" is one whose Android is
+UNIQUE's, and UNIQUE answers with the game's real package name and its real signing
+certificate — which it has, because it holds the game's APK. This is designed
+(`ARCHITECTURE.md` §9.3, "Mode A") and not implemented. It needs Play services, Google
+Services Framework and the Play Store imported from your own phone, sign-in intents kept
+inside the space instead of leaving to the host's copy, a device check-in that may or may
+not succeed, and 150–250 MB of RAM per space. It is a large piece of work, not a setting.
+
+**What it still would not fix:** Play Integrity and its equivalents, which attest the device
+and the app *as Android sees them*. Standoff 2 ships Play Integrity. Your ChatGPT error,
+`preauth_cookie_device_check_failed`, is OpenAI's own version of the same idea. UNIQUE is
+not an attestation bypass and this does not change that.
+
+**One thing that is fixable and is a separate job:** apps that sign in through the browser
+(ChatGPT is one) fail for a different reason — the sign-in completes on Google's side and
+the redirect back has nowhere to land, because the app the redirect names is not installed
+on your phone. Keeping that whole exchange inside the app's own process, in a WebView
+UNIQUE owns, would fix it without Play services at all. It would not help Standoff 2, which
+uses the native Google API.
+
+### What I need from the next log
+
+1. **Open two or three apps that had data in them, before the game.** This build changes
+   every file operation of every app. A mistake here does not crash — the app just looks
+   empty. It is the only failure that would not announce itself.
+2. `GUEST_PATHS_PUBLISHED … code=true data=true`, and no `paths` failure.
+3. Whether the "virtual space" notice appears in Standoff 2 — and whether the
+   "not enough memory" one is gone.
+
+## What changed one run ago
+
 **Your last log was the best one yet: seventeen of eighteen checks passed.** The game
 launched, ran, did not crash, and did not die on the sign-in button the way it did before.
 The `/proc` cover that had a hole in it last time is now complete on your phone — the
@@ -132,7 +230,7 @@ such thing — the only line containing that word was UNIQUE's own explanation o
 *would* happen. A tool that cannot tell its own prediction from a real answer is worse than
 no tool, because both read identically. Fixed, with a test.
 
-## What changed one run ago
+## What changed two runs ago
 
 **I read the game.** Two passes were spent guessing at what Standoff 2 checks; this time
 the check itself was found, in the shipping build, and it is not what either of us assumed.
@@ -227,7 +325,7 @@ What was new is underneath, and it is worse than the crash:
   the protector changes its mind is a measurement, not a promise — if it still fails, it
   fails for a reason worth reading.
 
-## What changed two runs ago
+## What changed three runs ago
 
 The rewrite from the last build worked — your log shows 17 requests going out under a
 name Google accepts, and the game-files message is gone. What it uncovered is three more
@@ -254,7 +352,7 @@ covered all of them.** The `DEVELOPER_ERROR` is real for a request that reaches 
 UNIQUE. But this crash never reached Google at all. Try signing in on this build and send
 the log: what happens now is something nobody has measured, me included.
 
-## What changed three runs ago
+## What changed four runs ago
 
 - **Google Play services actually works now.** There was one refusal behind every Google
   failure this project has ever had: Play services checks that the calling app's name
@@ -279,7 +377,7 @@ the log: what happens now is something nobody has measured, me included.
   picker reaches, several at once. It is still reachable from an app's own Storage
   section, which opens it directly inside that app.
 
-## What changed four runs ago
+## What changed five runs ago
 
 Six things were reported. Two of them were mistakes of mine, one was a request, and the
 log had all of them.
@@ -314,7 +412,7 @@ log had all of them.
   services resolves the caller to UNIQUE, so a token comes back for UNIQUE and not for the
   app. Only Play services running *inside* the space can answer that, and it is not built.
 
-## What changed five runs ago
+## What changed six runs ago
 
 That log was answered with two words — *"nothing changed"* — and a screenshot of a
 notification asking to install Google Play services. That was fair. The build was
@@ -341,7 +439,7 @@ installed and its new code was running; the code was wrong.
   passed on the log that produced that notification; this is the seventeenth, and it is
   asserted against that same log so the rule cannot come back quietly.
 
-## What changed six runs ago
+## What changed seven runs ago
 
 Six apps launched in that run and three of them died seconds later, all of the same thing.
 This build answers everything that log reported.
@@ -492,18 +590,19 @@ answer it. Everything else — hardware Vulkan, WebView rendering, Play Integrit
 Billing, Play Games — is still `NOT_TESTED` or `UNSUPPORTED` and stays that way until a run
 says otherwise.
 
-This build also carries the widest change the engine has ever had — every file operation of
-every app goes through it — and no phone has run it yet. That is stated plainly rather than
-left in a footnote.
+This build carries the widest change the engine has ever had — file access in *every*
+library of every app goes through it — and no phone has run it yet. The previous build's
+narrower version of the same change broke something visible, which is stated above rather
+than left in a footnote.
 
 What would help most from the next log, in order:
 
-1. **`GUEST_PATHS_PUBLISHED … code=true data=true`** — the new line. `data=false` is the
-   designed safe outcome, not a failure, and `detail=` says which check refused.
-2. **Whether apps you already had still have their data.** Open two or three with something
-   saved in them, before the game. This is the only failure here that would not announce
-   itself.
-3. **Whether the "virtual space" notice still appears in the game.**
+1. **Whether apps you already had still have their data.** Open two or three with something
+   saved in them, before the game. This build redirects file access in *every* library of
+   every app; a mistake there does not crash, the app just looks empty.
+2. **`GUEST_PATHS_PUBLISHED … code=true data=true`**, and no `paths` failure.
+3. **Whether the "virtual space" notice still appears in the game**, and whether the
+   "not enough memory" one is gone.
 4. **`PROC_VIEW_INSTALLED … leaked=0`**, still — the check now reads around its own cover
    rather than through it, so it can still fail, which is the point of it.
 5. **`GMS_PACKAGE_NOT_REWRITTEN`**, if it appears — that line names the last Google route

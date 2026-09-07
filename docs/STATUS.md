@@ -30,6 +30,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Virtual path contract | 12 | Every accessor and every alias pinned |
 | Native redirect table (C++) | 34 checks | Host-side binary, no device needed |
 | The two path tables are inverses (C++) | 27 checks | Every path a guest is handed round-trips; no rule can match UNIQUE's own files |
+| The relocation a GOT hook must patch | 2 checks | Taking the address of a libc function compiles to an absolute, zero-addend data relocation — the case SQLite uses and the hook used to skip |
 | Signature-agnostic shim engine | 12 | Includes one shim bound to two different signatures, and conditional `proceed()` |
 | Settings screens a guest opens about itself | 6 | Which half of the intent names the app, and every case that must be left alone |
 | Device profile model | 9 | Shape, stability, regeneration, RFC 4122 |
@@ -46,7 +47,7 @@ Every device claim below names the environment. Nothing is marked working on rea
 | Which packages a guest may see | 6 | The Google stack hidden, `com.android.vending` not, a prefix match not enough, and both shapes intent resolution answers in — the emulator has no Play services, so this is where the decision is pinned |
 | Window and task attributes | 9 | `hardwareAccelerated` at both levels including the `targetSdk >= 14` default, orientation, config changes, the task flags, typed meta-data, and a provider's own grant flag — against real `aapt2` output |
 
-**290 JVM tests, 15 Dart tests, 92 native checks, 109 off-device tool tests — all passing.**
+**290 JVM tests, 15 Dart tests, 94 native checks, 114 off-device tool tests — all passing.**
 
 ## On device (EMU34): verified working
 
@@ -1257,6 +1258,100 @@ The Google sign-in refusal is *not* expected to move: `AppVerification` rides on
 This closes the virtual-space verdict, not the Google identity, and those are different
 problems with different ceilings.
 
+### The fourteenth run: both gates fired, and one of them was right to
+
+The first log from a build that tells a guest it is installed. It is the most useful log
+this project has had, and not because things worked.
+
+**The data gate refused, and named itself.**
+
+```
+GUEST_PATHS_PUBLISHED package=com.axlebolt.standoff2 code=true data=false
+    detail=a database cannot be opened through the public path:
+           SQLiteDiskIOException: disk I/O error (code 1802 SQLITE_IOERR_FSTAT)
+```
+
+with SQLite's own diagnosis two lines above it:
+
+```
+W SQLiteLog: (28) file renamed while open:
+    /data/data/com.axlebolt.standoff2/databases/.unique-path-probe.db
+```
+
+The file probe passed and the database probe did not, on the same directory, in the same
+millisecond — which is exactly the split the second probe was added for and the reason it
+was not enough to write a byte and read it back.
+
+The cause is in `plt_hook.cpp` and it is worth stating precisely, because it is a whole
+class of gap rather than one symbol. A GOT hook patches calls: `R_AARCH64_JUMP_SLOT` for a
+PLT call, `GLOB_DAT` for a GOT read. **Taking the address of a libc function in a static
+initialiser is neither.** It is an absolute data relocation the linker resolves once at
+load time into the library's own `.data.rel.ro`, and every later call reads it from there.
+SQLite is built exactly that way:
+
+```c
+static struct unix_syscall { const char *zName; sqlite3_syscall_ptr pCurrent; } aSyscall[] = {
+  { "open",  (sqlite3_syscall_ptr)posixOpen, 0 },   /* a local wrapper -> reaches the PLT */
+  { "stat",  (sqlite3_syscall_ptr)stat,      0 },   /* the address     -> does not        */
+  { "lstat", (sqlite3_syscall_ptr)lstat,     0 },
+```
+
+So `open` was redirected and `stat` was not, inside one library. SQLite opened the database
+in the instance, looked for it at the path it had been given, did not find it, and said so.
+Its `lstat` reaching the real filesystem is also why `/data/user/0` appears resolved to
+`/data/data` in that message — a rewriting no rule of UNIQUE's produces, and the detail
+that turned a guess into a diagnosis. `R_AARCH64_ABS64` with a zero addend is patched now,
+and `tools/native-test/run.sh` compiles that construct and asserts the relocation it
+produces, so the premise is checked rather than remembered.
+
+**The code gate did not exist, and should have.**
+
+```
+E misc: isReadonlyFilesystem():
+    statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk) failed:
+    No such file or directory
+```
+
+The code half was published unconditionally, on the argument that a wrong value there could
+lose nothing because the class loader and resources were already built. That argument was
+about UNIQUE and said nothing about the rest of the process. A system library nobody had
+listed read the published `sourceDir` and could not open it, because it was outside a scope
+of three libraries — and the user's report of what the game then showed was that the device
+was out of space.
+
+**A path handed to a guest is handed to every library in the guest's process, and any of
+them may be the one that opens it.** Publishing such a path while hooking part of the
+process is worse than publishing nothing: it works for some callers and not others, and the
+failure arrives as the guest's own bug. So the scope is the whole process now, minus the
+linker, `libc`/`libdl`/`libm`, UNIQUE's own native library and the per-app exclusions. What
+makes that safe is unchanged and is a property of the table rather than of the scope — no
+rule can match `/data/user/0/com.unique` — and `round_trip_test.cpp` asserts it by name.
+
+The code half is gated too now: no slots patched, or a published `base.apk` that does not
+open, and it is not published.
+
+Three smaller things from the same log:
+
+- **The scan is memoised.** With the whole process in scope, re-walking four hundred
+  libraries' relocation tables on every `dlopen` is not free. Each set of hook requests
+  owns its own memo — sharing one between the redirect and the load watch would have the
+  first mark libraries as done for the second, which would then patch nothing and never
+  say so.
+- **`NOTHING_TO_HOOK` was reported on every re-scan**, because the status read that pass's
+  slot count rather than the cumulative one. A healthy re-scan patches nothing. It reads
+  the total now.
+- **The analyzer gained a `paths` check**, written against this log: it reports the gates
+  refusing as notes, and fails on a published path that some caller could not open. The
+  distinction is the point — the first is the design working, the second is the bug.
+
+**What the next log has to show.** `GUEST_PATHS_PUBLISHED … code=true data=true`, no
+`paths` failure, `detection` still at `leaked=0`, and every app that had data still having
+it — the scope change touches every file operation of every guest, and a regression there
+looks like an app that is empty rather than one that crashes. The new
+`io_redirect: hooked <lib>=<n>` lines say which libraries the redirect actually reached, and
+`io_redirect: nothing in this process imports: …` names any symbol in the table that nothing
+spells that way. Either line would have named this run's bug on sight.
+
 ### What the sixth run settled about Google sign-in
 
 The Google layer used to answer `PASSTHROUGH` for `SIGN_IN` whenever an app declared an
@@ -1449,22 +1544,24 @@ caught `restrictions`, `locale` and `connectivity` before one did.
 
 ## Next steps, in order
 
-1. **The fourteenth phone run.** This pass changed every file operation of every guest and
-   the identity a guest reports for itself; neither can be observed anywhere but on a
-   phone. In order of what would matter most if it were wrong:
-   - `GUEST_PATHS_PUBLISHED package=… code=true data=true`. `data=false` is not a crash
-     and not a regression — it means the probe refused, and `detail=` says which of the two
-     probes and why. The code half applying with the data half refused is the designed
-     fallback, not a half-failure.
+1. **The fifteenth phone run.** This pass hooks every library in every guest's process and
+   changed the identity a guest reports for itself; neither can be observed anywhere but on
+   a phone. In order of what would matter most if it were wrong:
    - **Every app that ran before still running, and still holding its own data.** A guest
      that cannot find its saved games is what a redirect gone wrong looks like; it does not
      announce itself. Open something with state — a launcher, a browser with a session, an
      app that was signed in — before looking at the game.
+   - `GUEST_PATHS_PUBLISHED … code=true data=true`, and the `paths` check green. `data=false`
+     is not a crash and not a regression — it means a gate refused, and `detail=` says which
+     one and why.
+   - `io_redirect: hooked <lib>=<n>` for the libraries the redirect reached, and
+     `io_redirect: nothing in this process imports: …` for any symbol in the table nothing
+     spells that way. The fourteenth run's bug was invisible for want of those two lines.
    - `PROC_VIEW_INSTALLED … leaked=0`, still, now that the check reads around the view
      rather than through it.
    - The game: whether `Anticheat/VirtualSpaceWarning` still appears. That is the flag this
      pass is aimed at. `AuthRestrictions/VirtualSpaceMessage` on sign-in is a *different*
-     ceiling and is not expected to move — see the thirteenth run's section.
+     ceiling and is not expected to move — see `docs/GOOGLE_SIGN_IN.md`.
 2. **The seventh phone run's open items**, which the verification emulator still cannot
    answer: it has no Play services, no IME, no `Android/obb` to import from and no
    code-virtualization protector to break. What to watch for, in the order the sixth run

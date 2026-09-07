@@ -1301,10 +1301,30 @@ Four decisions worth stating, because each was the alternative to something wors
    again. The twelfth phone run is what this is for: `named=15 leaked=2`, naming the
    `/data/data/<pkg>` alias the table was missing.
 
-**Scope, and what is outside it.** The hook is a PLT patch in the guest's own libraries
-*and* in the three platform libraries through which the guest's Java file operations pass
-— see §7.3.2. It does not cover `dl_iterate_phdr` and `dladdr`, which read the linker's
-tables and open nothing, nor a raw `syscall(SYS_openat, …)`, which crosses no PLT.
+**Scope, and what is outside it.** The hook covers **every library in the guest's
+process**, minus the linker, `libc`/`libdl`/`libm`, UNIQUE's own native library, and the
+per-app exclusions (`GuestNativeExclusions`). It does not cover `dl_iterate_phdr` and
+`dladdr`, which read the linker's tables and open nothing, nor a raw
+`syscall(SYS_openat, …)`, which crosses no PLT.
+
+It was narrower twice — the guest's own libraries, then those plus `libjavacore.so`,
+`libsqlite.so` and `libandroid_runtime.so` — and the fourteenth phone run ended both. See
+§7.3.2: a path handed to a guest is handed to every library in the guest's process, and
+any of them may be the one that opens it.
+
+Two relocation subtleties, both of which cost a build:
+
+- A call goes through the PLT (`R_AARCH64_JUMP_SLOT`) or the GOT (`GLOB_DAT`), and both
+  were patched. **Taking the *address* of a libc function in a static initialiser is
+  neither**: it is an absolute data relocation the linker resolves once at load, into the
+  library's own `.data.rel.ro`. SQLite is built that way — `open` is wrapped in a local
+  function and reaches the PLT, `stat` and `lstat` are stored by address and do not — so
+  one library had half its file calls redirected. `R_AARCH64_ABS64` with a zero addend is
+  patched too; `tools/native-test/run.sh` asserts that the construct still compiles to
+  that relocation.
+- The scan is repeated on every library load and now skips libraries a previous pass
+  walked. Each set of hook requests owns its memo: sharing one between the redirect and the
+  load watch would have the first mark libraries done for the second.
 
 ### 7.3.2 The guest is told it is installed
 
@@ -1330,34 +1350,52 @@ possible to do at all:
    real files. `round_trip_test.cpp` asserts the two tables are inverses on the exact
    paths a guest is handed.
 
-For the second to be true of a guest's **Java** code, three platform libraries are in the
-hook's scope: `libjavacore.so` (every `java.io.File`, stream and `SharedPreferences`),
-`libsqlite.so` and `libandroid_runtime.so` (every `SQLiteDatabase` opened by absolute
-path). Android's libcore is written against the directory-relative calls, so the scope also
-had to grow `openat`, `fstatat`/`fstatat64`, `faccessat`, `mkdirat`, `unlinkat`,
-`renameat`, `readlinkat`, `fchmodat`, plus `realpath` and `statvfs`.
+For the second to be true, the hook covers the whole process. Android's libcore is written
+against the directory-relative calls, so the symbol table also had to grow `openat`,
+`fstatat`/`fstatat64`, `faccessat`, `mkdirat`, `unlinkat`, `renameat`, `readlinkat`,
+`fchmodat`, `realpath` and `statvfs` alongside the plain names.
 
-Widening a redirect into the platform's own libraries is the largest blast radius in this
-engine, and the argument that it is safe is a property of the **table**, not of the scope:
-every rule in `redirectionRules` names either the guest's package (`/data/data/<guest>`,
+Three platform libraries were tried first and were not enough. The fourteenth phone run is
+the argument, and it is short:
+
+```
+E misc: isReadonlyFilesystem():
+    statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk) failed:
+    No such file or directory
+```
+
+One system library nobody had listed read the published `sourceDir` and could not open it.
+Publishing a path while hooking part of the process is worse than publishing nothing: the
+path works for some callers and not others, and the failure arrives as the guest's own bug —
+which is how it arrived, as a game reporting the device was out of space.
+
+Redirecting in every library is the largest blast radius in this engine, and the argument
+that it is safe is a property of the **table**, not of the scope: every rule in
+`redirectionRules` names either the guest's package (`/data/data/<guest>`,
 `/data/user/0/<guest>`, `/data/app/…<guest>…`) or a shared-storage alias (`/sdcard`,
 `/storage/emulated/0`, `/storage/self/primary`, `/mnt/sdcard`). **None can match a path
 under `/data/user/0/com.unique`**, so UNIQUE's own operations in the same process pass
-through untouched whatever library makes them. `round_trip_test.cpp` asserts that too,
-against UNIQUE's own prefs, database, diagnostics and installed APK.
+through untouched whatever library makes them. `round_trip_test.cpp` asserts that by name,
+against UNIQUE's own prefs, database, diagnostics and installed APK. The hook being
+everywhere is not the redirect being everywhere: it is the table being asked in every
+library, and the table is what decides.
 
 `realpath` is the one call that runs both directions at once: the argument goes inward so
 the call succeeds, and the answer comes back outward through the `/proc` view so
 `File.getCanonicalPath()` does not become the single accessor that still hands a guest
 UNIQUE's directory.
 
-**The data half is measured, not reasoned about.** Reporting a data directory that does not
-resolve would not fail visibly; it would fail as a guest that silently cannot read its own
-saved games. So it is applied only after a probe writes a byte through the published path
-and finds it at the real one — twice, once through `java.io.File` and once by opening a
-SQLite database, because those are different hooks. The code half is not gated: the class
-loader and resources are already built, and a wrong value there loses nothing. Both halves
-are reported: `GUEST_PATHS_PUBLISHED package=… code=… data=… apk=… detail=…`.
+**Neither half is applied until it is measured.** The code half needs the redirect to be
+installed — slots actually patched — and the published `base.apk` to open; with no redirect
+a published path is a string, not a path. The data half needs a round trip: a byte written
+through the published path and found at the real one, twice, once through `java.io.File`
+and once by opening a SQLite database, because those reach the filesystem through different
+hooks. Either refusal leaves the real paths in place and says which check refused:
+`GUEST_PATHS_PUBLISHED package=… code=… data=… slots=… apk=… detail=…`.
+
+The database probe earned its place on its first run. `java.io.File` round-tripped and
+SQLite did not, because of the relocation gap above — so a file probe alone would have
+published a data directory in which every database the guest opened failed.
 
 **One rule this created.** `VirtualPathModel` is constructed from `context.filesDir` in a
 dozen places, which was correct for exactly as long as `getFilesDir()` in a `:vappN` could

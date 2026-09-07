@@ -28,6 +28,13 @@ struct HookRequest {
     const char* symbol;
     void* replacement;
     void** original;   // filled with the previous GOT value, may be null
+    /// Set by hook_all when any library in the process referenced this symbol at all.
+    /// A symbol nothing imports is not an error - most libraries want a handful of these
+    /// - but "hooked and never called" and "never hooked because nothing in this process
+    /// spells it that way" are different problems, and only the report can tell them
+    /// apart. The fourteenth phone log is the argument: `stat` was in the table, was
+    /// never patched anywhere, and looked exactly like a symbol nobody used.
+    bool matched = false;
 };
 
 struct HookReport {
@@ -43,10 +50,20 @@ struct HookReport {
     /// Libraries in scope that an exclusion kept out, so a library that is *not* hooked
     /// on purpose never looks like one the scan failed to find.
     std::vector<std::string> excluded;
+    /// Libraries skipped because a previous scan already walked them. The scan is
+    /// re-run on every library load, and with a process-wide scope re-walking four
+    /// hundred libraries' relocations each time is not free.
+    int libraries_already_scanned = 0;
+    /// "<library>=<slots>" for the libraries this pass actually patched something in,
+    /// newest first and bounded. Which library a redirect reached is otherwise a number
+    /// with no name attached to it.
+    std::vector<std::string> per_library;
 };
 
-// Patches every GOT slot in the loaded libraries whose path contains one of
-// `path_filters` (empty means every library) for each requested symbol.
+// Patches every address slot in the loaded libraries whose path contains one of
+// `path_filters` for each requested symbol. A single filter of "*" means every library,
+// which is the scope UNIQUE runs with: see io_redirect::set_scope for why a narrower one
+// cannot work, and what makes a wide one safe.
 //
 // A library whose path contains one of `path_excludes` is skipped even when it is in
 // scope, and named in the report. Exclusions exist because a PLT hook is not universally
@@ -55,8 +72,15 @@ struct HookReport {
 // io_redirect::set_exclusions for the run that established this.
 //
 // Idempotent: a slot already pointing at the replacement is left alone and not counted.
+//
+// `seen` is the caller's memo of libraries a previous call with *these* requests already
+// walked, and is appended to. Each set of requests needs its own: two hook sets sharing
+// one memo would have the first one's scan mark libraries as done for the second, which
+// would then patch nothing in them and never say so. Pass an empty vector to walk
+// everything.
 HookReport hook_all(const std::vector<std::string>& path_filters,
                     const std::vector<std::string>& path_excludes,
-                    HookRequest* requests, size_t request_count);
+                    HookRequest* requests, size_t request_count,
+                    std::vector<std::string>& seen);
 
 }  // namespace unique::plt

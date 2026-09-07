@@ -432,6 +432,88 @@ def check_slots(run: Run) -> Check:
     return check
 
 
+# The path, then whatever the caller said went wrong with it. The path is stopped at the
+# first character that cannot be in one — a closing parenthesis, because these arrive as
+# `statfs(<path>) failed: …` and capturing the bracket would put it in the report.
+_PATH_FAILED = re.compile(
+    r"(/data/app/~~[A-Za-z0-9_-]+/[^\s):,]+)\)? failed: (.+)"
+)
+
+
+def check_guest_paths(run: Run) -> Check:
+    """Did the paths a guest was told it has actually resolve?
+
+    UNIQUE tells a guest that its APK is at `/data/app/~~<a>/<pkg>-<b>/base.apk` and its
+    data at `/data/user/0/<pkg>`, because that is what an installed copy reports and
+    because one shipping game's whole virtual-space check is four getters that used to
+    answer with `com.unique` (`docs/STANDOFF2.md`). Neither path exists on the device.
+    They work because every file operation in the process is redirected back.
+
+    So the interesting failure is not "the path was not published". It is **a published
+    path that some caller could not open**, which is worse than not publishing it: the
+    path works for the callers UNIQUE covers and not for the rest, and the guest reports
+    it as its own fault. The fourteenth run is what this check is written from —
+
+        E misc: isReadonlyFilesystem():
+            statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk) failed:
+            No such file or directory
+
+    — one system library outside the hook's scope, and a game telling its player the
+    device was out of space.
+    """
+    check = Check("paths", "Did the paths a guest was told it has actually resolve?")
+    published = run.by_code("GUEST_PATHS_PUBLISHED")
+    if not published:
+        check.note("this build does not publish installed-shaped paths; nothing to check")
+        return check
+
+    for event in published:
+        code = (event["code"] or "false") == "true"
+        data = (event["data"] or "false") == "true"
+        if code and data:
+            check.note(f"{event['package']}: code and data paths both published")
+        elif code:
+            # Not a failure. The data half is gated on a round-trip probe precisely so
+            # that a path which does not resolve is never handed to a guest, and the
+            # probe refusing is that gate working.
+            check.note(
+                f"{event['package']}: code paths published, data paths held back — "
+                f"{event['detail']}"
+            )
+        else:
+            check.fail(
+                f"{event['package']}: no installed-shaped paths were published at all — "
+                f"{event['detail']}",
+                event.lineno,
+            )
+
+    # The published paths, as this run actually spelled them, so a failure naming one is
+    # matched against what was published rather than against a shape.
+    prefixes = {e["apk"] for e in published if e["apk"]}
+    reported: Set[str] = set()
+    for line in run.lines:
+        if line.tag == UNIQUE_TAG or "failed" not in line.message:
+            continue
+        m = _PATH_FAILED.search(line.message)
+        if not m:
+            continue
+        path, reason = m.group(1), m.group(2).strip()
+        if not any(path.startswith(prefix) for prefix in prefixes):
+            continue
+        key = f"{line.tag}:{reason}"
+        if key in reported:
+            continue
+        reported.add(key)
+        check.fail(
+            f"a published path did not resolve for {line.tag}: {path} — {reason}. "
+            f"The caller is a library outside the redirect's scope, so the path UNIQUE "
+            f"handed the guest exists for some callers and not others",
+            line.lineno,
+            line.message.strip()[:200],
+        )
+    return check
+
+
 def check_detection(run: Run) -> Check:
     """Could a guest read UNIQUE out of its own process?
 
@@ -1251,6 +1333,7 @@ CHECKS = (
     check_google_stack,
     check_native_hooks,
     check_detection,
+    check_guest_paths,
     check_hooks,
     check_providers,
     check_isolation,

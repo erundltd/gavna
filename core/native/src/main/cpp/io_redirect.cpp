@@ -529,6 +529,43 @@ std::string read_unviewed(const char* path) {
     return path == nullptr ? std::string() : read_all(path);
 }
 
+/// Which libraries the interception covers. `"*"` means every one of them.
+///
+/// ## Why the whole process, which was not the first answer
+///
+/// The scope was the guest's own libraries, then those plus three of the platform's. The
+/// fourteenth phone log ended that: with the guest reporting an installed-shaped
+/// `sourceDir`, a system library nobody had thought about read it and could not open it —
+///
+/// ```
+/// E misc: isReadonlyFilesystem():
+///     statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk) failed:
+///     No such file or directory
+/// ```
+///
+/// — because that library was outside the scope, so its `statfs` went to the real
+/// filesystem, where no such directory exists. A path handed to a guest is handed to
+/// every library in the guest's process, and any of them may be the one that opens it.
+/// Publishing such a path and hooking only some of the process is worse than publishing
+/// nothing: the path exists for some callers and not others, and the failure surfaces as
+/// the guest's own bug.
+///
+/// ## Why that is safe, which is a property of the table
+///
+/// Every rule in `VirtualPathModel.redirectionRules` names either the *guest's* package
+/// (`/data/data/<guest>`, `/data/user/0/<guest>`, `/data/app/…<guest>…`) or a
+/// shared-storage alias (`/sdcard`, `/storage/emulated/0`, `/storage/self/primary`,
+/// `/mnt/sdcard`). None of them can match a path under `/data/user/0/com.unique`, so
+/// UNIQUE's own file operations pass through untouched no matter which library makes
+/// them — `round_trip_test.cpp` asserts exactly that, by name, against UNIQUE's own
+/// preferences, database, diagnostics and installed APK.
+///
+/// So the hook being everywhere does not mean the *redirect* is everywhere. It means the
+/// table gets asked in every library instead of three, and the table is what decides.
+///
+/// The exclusions still apply on top, and now matter more: a library left out is a
+/// library where a published path does not resolve. That cost is stated in
+/// COMPATIBILITY.md rather than discovered.
 void set_scope(const char** paths, int count) {
     std::vector<std::string> filters;
     for (int i = 0; i < count; ++i) {
@@ -562,7 +599,10 @@ int slots_patched() { return g_slots_patched; }
 /// The scan itself. Split out so the loader trampolines can re-run it without recursing
 /// through the public entry point's scope checks.
 InstallStatus install_locked() {
-    plt::HookRequest requests[] = {
+    // Static because the scan is repeated and each pass only walks libraries it has not
+    // seen. `matched` and the saved originals have to survive from one pass to the next,
+    // or a re-scan would report every symbol as one nothing in the process imports.
+    static plt::HookRequest requests[] = {
         {"open",     reinterpret_cast<void*>(h_open),     reinterpret_cast<void**>(&o_open)},
         {"openat",   reinterpret_cast<void*>(h_openat),   reinterpret_cast<void**>(&o_openat)},
         {"stat",     reinterpret_cast<void*>(h_stat),     reinterpret_cast<void**>(&o_stat)},
@@ -592,6 +632,10 @@ InstallStatus install_locked() {
         {"realpath",    reinterpret_cast<void*>(h_realpath),    reinterpret_cast<void**>(&o_realpath)},
         {"statvfs",     reinterpret_cast<void*>(h_statvfs),     reinterpret_cast<void**>(&o_statvfs)},
         {"statvfs64",   reinterpret_cast<void*>(h_statvfs),     reinterpret_cast<void**>(&o_statvfs)},
+
+        // `__openat` and `__open_2` are bionic's fortified spellings, emitted when a
+        // library is built with `_FORTIFY_SOURCE`. Most of the platform is.
+        {"__openat",    reinterpret_cast<void*>(h_openat),       reinterpret_cast<void**>(&o_openat)},
     };
 
     std::vector<std::string> filters;
@@ -602,16 +646,19 @@ InstallStatus install_locked() {
         excludes = g_excludes;
     }
     if (filters.empty()) {
-        // Refused rather than applied everywhere. An unscoped hook would patch UNIQUE's
-        // own libraries and the platform's, and "redirect every file operation in the
-        // process" is not a thing to do by accident.
+        // Refused rather than applied everywhere. The scope is process-wide by design
+        // now, but it is asked for with an explicit `"*"`: a scope that was never
+        // published and one that was widened on purpose must not behave the same way.
         ULOGW("io_redirect::install() refused: no scope set");
         g_installed = false;
         return InstallStatus::kFailed;
     }
 
+    // One memo per request set: the load watch below hooks a different symbol and must
+    // not have its scan mark libraries as done for this one.
+    static std::vector<std::string> seen;
     auto report = plt::hook_all(filters, excludes, requests,
-                                sizeof(requests) / sizeof(requests[0]));
+                                sizeof(requests) / sizeof(requests[0]), seen);
     g_slots_patched += report.slots_patched;
     for (const auto& failure : report.failures) {
         ULOGE("io_redirect: %s", failure.c_str());
@@ -619,10 +666,34 @@ InstallStatus install_locked() {
     for (const auto& name : report.excluded) {
         ULOGI("io_redirect: excluded (not hooked, on purpose): %s", name.c_str());
     }
-    ULOGI("io_redirect installed: %d slot(s) in %d/%d libraries (%d excluded, %d total), "
-          "%d rule(s), page size %ld",
+    ULOGI("io_redirect installed: %d slot(s) in %d/%d libraries (%d excluded, %d seen "
+          "before, %d total), %d rule(s), page size %ld",
           report.slots_patched, report.libraries_matched, report.libraries_scanned,
-          report.libraries_excluded, g_slots_patched, rule_count(), sysconf(_SC_PAGESIZE));
+          report.libraries_excluded, report.libraries_already_scanned, g_slots_patched,
+          rule_count(), sysconf(_SC_PAGESIZE));
+    // Which library, not just how many. A redirect that reached `libjavacore.so` and not
+    // `libsqlite.so` is a different engine from one that reached both, and the two used
+    // to print the same line.
+    for (const auto& entry : report.per_library) {
+        ULOGI("io_redirect: hooked %s", entry.c_str());
+    }
+    // And which of the names in the table nothing in this process spells that way. This
+    // is the line that would have named the fourteenth run's bug on sight: `stat` was
+    // requested, was imported by libraries that were in scope, and was patched nowhere,
+    // because SQLite holds its address in a data relocation rather than calling it
+    // through the PLT.
+    {
+        std::string missing;
+        for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); ++i) {
+            if (!requests[i].matched) {
+                if (!missing.empty()) missing += ",";
+                missing += requests[i].symbol;
+            }
+        }
+        if (!missing.empty()) {
+            ULOGI("io_redirect: nothing in this process imports: %s", missing.c_str());
+        }
+    }
     if (report.libraries_matched == 0) {
         for (const auto& filter : filters) {
             ULOGW("io_redirect: filter did not match: %s", filter.c_str());
@@ -636,8 +707,12 @@ InstallStatus install_locked() {
     // nothing to hook, and one that loads its libraries later has nothing to hook *yet* -
     // but it must not be reported as a working interception either. kNothingToHook says
     // both, where the not-implemented status used to say neither.
-    g_installed = report.slots_patched > 0;
-    return report.slots_patched > 0 ? InstallStatus::kOk : InstallStatus::kNothingToHook;
+    //
+    // The *cumulative* count decides, not this pass's. Every pass after the first walks
+    // only libraries it has not seen, so a healthy re-scan patches nothing and used to
+    // report the interception as absent - which is the opposite of what it means.
+    g_installed = g_slots_patched > 0;
+    return g_slots_patched > 0 ? InstallStatus::kOk : InstallStatus::kNothingToHook;
 }
 
 InstallStatus install() { return install_locked(); }
@@ -680,7 +755,10 @@ InstallStatus watch_library_loads() {
     // run again afterwards, and install_locked is where the exclusions apply. Excluding a
     // protector from the *watch* would mean a library it loads is never redirected at
     // all, which is a different and larger loss than not redirecting the protector.
-    auto report = plt::hook_all(scope, {}, requests, sizeof(requests) / sizeof(requests[0]));
+    static std::vector<std::string> seen;
+    static const std::vector<std::string> no_excludes;
+    auto report = plt::hook_all(scope, no_excludes, requests,
+                                sizeof(requests) / sizeof(requests[0]), seen);
     g_watching = report.slots_patched > 0;
     ULOGI("io_redirect: library-load watch %s (%d slot(s) in %d libraries)",
           g_watching ? "installed" : "found nothing to hook",

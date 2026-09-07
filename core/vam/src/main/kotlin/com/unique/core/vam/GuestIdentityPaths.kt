@@ -6,6 +6,7 @@ import com.unique.core.common.diag.DiagChannel
 import com.unique.core.common.path.VirtualPathModel
 import com.unique.core.diagnostics.Diagnostics
 import com.unique.core.hook.Reflect
+import com.unique.core.nativebridge.UniqueNative
 import java.io.File
 
 /**
@@ -46,27 +47,32 @@ import java.io.File
  *    `LoadedApk.mAppDir`, which `getPackageCodePath()` returns and nothing else reads, and
  *    the `ApplicationInfo` object, which by then has already done its work. `mResDir`,
  *    `mSplitResDirs`, `mLibDir` and `mClassLoader` are deliberately left alone.
- * 2. **The redirect goes both ways.** `VirtualPathModel.redirectionRules` maps the public
- *    APK directory back to the real one and `/data/user/0/<guest>` back to the instance,
- *    and the interception now covers `libjavacore.so` — so a path handed out here is a
- *    path that opens, from Java and from native code alike.
+ * 2. **The redirect goes both ways, in every library.** `VirtualPathModel.redirectionRules`
+ *    maps the public APK directory back to the real one and `/data/user/0/<guest>` back to
+ *    the instance, and the interception covers the whole process — so a path handed out
+ *    here is a path that opens, from Java, from the guest's native code, and from whatever
+ *    system library the guest hands it to.
  *
  * The change is also *additive*, which is what makes it safe to do part-way through a
  * process's life: the real paths are matched by no rule and keep working, so anything
  * already holding one — an open `SharedPreferences`, a `File` captured earlier — is
  * unaffected. Both spellings name the same bytes.
  *
- * ## The data directory is applied only when it is proven
+ * ## Neither half is applied until it is measured
  *
- * Reporting a data directory that does not resolve would not fail visibly; it would fail
- * as a guest that silently cannot read its own saved games. So the data half is gated on a
- * measurement rather than on the reasoning above: a byte is written through the public
- * path and looked for at the real one, in this process, on this device, with these hooks.
- * If it does not arrive, the data paths are left real and the log says so.
+ * A published path that does not resolve does not fail visibly. It fails as a guest that
+ * silently cannot read its own saved games, or — as the fourteenth phone run showed — as a
+ * game telling its player the device is out of space, because a system library outside the
+ * hook's reach could not `statfs` the APK path it had just been given. So:
  *
- * The code paths are not gated, because a wrong one cannot lose anything: the class loader
- * and resources are already built, and the guest's own reads of its APK go through the
- * native interception that has been in place since long before this.
+ * - The **code** half needs the redirect to be installed (slots patched) and the published
+ *   `base.apk` to open. With no redirect there is no path, only a string.
+ * - The **data** half needs a round trip: a byte written through the public path and found
+ *   at the real one, twice — once through `java.io.File` and once by opening a SQLite
+ *   database, because those reach the filesystem through different hooks.
+ *
+ * Either refusal leaves the real paths in place and says so in one line, with the reason.
+ * `GUEST_PATHS_PUBLISHED … code=… data=… detail=…`.
  */
 internal object GuestIdentityPaths {
 
@@ -155,7 +161,29 @@ internal object GuestIdentityPaths {
         val publicApkDir = plan.publicApkDir
         val publicDataDir = plan.publicDataDir
 
-        val code = runCatching {
+        // The code half is gated too, and the fourteenth phone run is why.
+        //
+        // It used to be unconditional, on the argument that a wrong code path could not
+        // lose anything because the class loader and resources were already built. That
+        // argument was about *UNIQUE*. It said nothing about the rest of the process:
+        //
+        //     E misc: isReadonlyFilesystem():
+        //         statfs(/data/app/~~kx_uUO…/com.axlebolt.standoff2-kROpHz…/base.apk)
+        //         failed: No such file or directory
+        //
+        // A published path is only a path if the redirect is in. With no slots patched
+        // there is no redirect, and publishing would hand every library in the process a
+        // path that resolves nowhere — which surfaced as a game telling its player the
+        // device was out of space.
+        val slots = runCatching { UniqueNative.redirectSlotsPatched() }.getOrDefault(0)
+        val codeRefusal = when {
+            slots <= 0 ->
+                "the redirect patched no slots, so a published path would resolve nowhere"
+            !File(plan.baseApk).isFile ->
+                "the published APK path does not open: ${plan.baseApk}"
+            else -> null
+        }
+        val code = if (codeRefusal != null) false else runCatching {
             infos.forEach { applyCodePaths(it, plan) }
             if (loadedApk != null) {
                 // `LoadedApk.mAppDir` is what `Context.getPackageCodePath()` returns, and
@@ -172,7 +200,7 @@ internal object GuestIdentityPaths {
         }.getOrDefault(false)
 
         val realDataDir = model.dataDir(params.vuid, params.packageName)
-        val refusal = probe(publicDataDir, realDataDir)
+        val refusal = codeRefusal ?: probe(publicDataDir, realDataDir)
         val data = if (refusal == null) {
             runCatching {
                 infos.forEach { applyDataPaths(it, publicDataDir) }
@@ -193,7 +221,7 @@ internal object GuestIdentityPaths {
             data = data,
             publicApkDir = publicApkDir,
             publicDataDir = publicDataDir,
-            detail = refusal ?: "the public data path round-tripped into the instance",
+            detail = refusal ?: "both paths round-tripped into the instance",
         )
         Diagnostics.event(
             DiagChannel.LAUNCH,
@@ -203,6 +231,9 @@ internal object GuestIdentityPaths {
             mapOf(
                 "package" to params.packageName,
                 "code" to code.toString(),
+                // How much interception was actually in when this decided. A published
+                // path with no redirect behind it is the failure mode this gates.
+                "slots" to slots.toString(),
                 "data" to data.toString(),
                 "apk" to publicApkDir,
                 "detail" to result.detail,

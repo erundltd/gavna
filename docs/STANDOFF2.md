@@ -189,13 +189,40 @@ virtualization detector. UNIQUE's tree is not in it, and adding UNIQUE to it wou
 someone at Axlebolt writing it down. It is recorded here so that it is not mistaken for the
 mechanism above.
 
-### Play Integrity is present, and is a separate ceiling
+### Play Integrity is in the build, and the phone says it is not used
 
 `Google.Play.Integrity`, `IntegrityManager`, `RequestIntegrityToken`, `environmentIntegrity`
 and `GooglePlayIntegrityCheckRpcException` are all in the build. Play Integrity attests the
 *calling package and certificate*, which inside UNIQUE is UNIQUE's. Nothing in this engine
 changes that, and nothing here should be read as suggesting otherwise — `README.md` says
 UNIQUE is not an attestation bypass, and that stands.
+
+**But a string in a binary is not a call, and the logs distinguish them.** Across the
+eleventh, thirteenth and fourteenth phone runs, `com.axlebolt.standoff2` binds the Play
+Integrity service **zero** times. Every UNIQUE process logs a cross-app service intent, so
+the absence is measured rather than assumed:
+
+| Bound by the game | Times, in three runs |
+|---|---|
+| `com.google.android.play.core.expressintegrityservice.BIND_EXPRESS_INTEGRITY_SERVICE` | **0** |
+| `com.google.android.gms.safetynet.service.START` | 3 — once per run |
+
+And the single SafetyNet bind is not the anti-cheat calling it. It arrives inside the
+ordinary GMS-common initialisation, milliseconds before
+`com.google.android.gms.usagereporting.service.START`, which is what Firebase and
+Crashlytics do on every start.
+
+For contrast, in the same fourteenth log, `com.openai.chatgpt` binds the express-integrity
+service **six** times — and ChatGPT is the app that answers
+`preauth_cookie_device_check_failed`. The distinction shows up in one file, from one
+device, on the same afternoon.
+
+So the honest position on attestation for *this* game is narrower than "it ships Play
+Integrity, therefore it is out of reach": the plugin is bundled, the code path did not run
+in any observed session, and the verdict the game actually acts on is the server's answer
+to `AppVerification`. That is not proof it never runs — a session that reached further into
+the game might call it — but it is what three runs on real hardware say, and it is the
+opposite of what the string table alone suggests.
 
 ---
 

@@ -96,9 +96,13 @@ says UNIQUE is not an attestation bypass; that stands, and Mode A does not chang
 This matters for the two apps that have been tested:
 
 - **Standoff 2** ships `Google.Play.Integrity`, `IntegrityManager`, `RequestIntegrityToken`
-  and `GooglePlayIntegrityCheckRpcException` (`docs/STANDOFF2.md`). Whether the server
-  *requires* a valid token or only records it is unknown and cannot be known from the
-  client.
+  and `GooglePlayIntegrityCheckRpcException` (`docs/STANDOFF2.md`) — and, across three
+  phone runs, **never binds the Play Integrity service at all**. Its only attestation-shaped
+  bind is one `safetynet.service.START` per run, arriving inside the ordinary GMS-common
+  initialisation beside `usagereporting.service.START`, which is what Firebase does on every
+  start. ChatGPT, in the same log, binds express-integrity six times. Whether Axlebolt's
+  server *requires* a token cannot be known from the client, but a code path that did not
+  run in any observed session is not the wall it was being treated as.
 - **ChatGPT** answers `error_code: preauth_cookie_device_check_failed`, which is OpenAI's
   own device check, not Google's. Same class of problem, same ceiling, different vendor.
 

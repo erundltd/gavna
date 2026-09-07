@@ -1,12 +1,20 @@
-# Google sign-in from inside UNIQUE: what blocks it, and what would not
+# Signing in from inside UNIQUE: what blocks it, and what does not
 
-The question this answers is the one that keeps being asked, and it deserves a document
-rather than a sentence in a release note: **can a virtual app sign in with Google the way
-the same app does when it is installed normally?**
+The question this answers keeps being asked, and it deserves a document rather than a
+sentence in a release note: **can a virtual app sign in the way the same app does when it
+is installed normally?**
 
-The answer is not "no". It is: **not through the phone's own Play services, ever, and
-there is exactly one route that could work.** Both halves matter, and this file is the
-evidence for each.
+The answer depends entirely on *who is asked to vouch for the app's identity*, and there
+are two answers, not one:
+
+| The SDK asks | Example | Can UNIQUE answer? |
+|---|---|---|
+| **Play services** — another process, resolving the caller by kernel uid | Google Sign-In | **No.** Not on an unrooted phone, not ever, without in-space GMS (§2) |
+| **the app's own `PackageManager`** | Facebook, VK, most SDKs | **Yes, already** — proven on the phone in §3 |
+
+So "you cannot sign in inside a virtual space" is false as a general statement. For
+Standoff 2 specifically, the realistic route to a working login is Facebook or VK, not
+Google, and §3 has the evidence and the one piece of work it still needs.
 
 ---
 
@@ -99,11 +107,94 @@ the guest indistinguishable from an installed app to a server that asks the plat
 
 ---
 
-## 3. The other route, which fixes a different set of apps
+## 3. The route that is already half-working, and the phone proved it
+
+There is a second identity mechanism, it is the one most SDKs use, and **UNIQUE already
+satisfies it**. The thirteenth phone run contains the proof, in a line nobody was looking
+for.
+
+Standoff 2 also offers Facebook login. The user tried it, and the Facebook SDK announced
+the app it thought it was running inside:
+
+```
+V com.facebook.unity.FB: Init({"appId":"752573801798020", …})
+D com.facebook.unity.FB: KeyHash: lcG7acvUIg0k4FQSQmAbyw1tN0o=
+```
+
+A Facebook key hash is `base64(SHA-1(signing certificate))`, computed at run time from
+`getPackageInfo(getPackageName(), GET_SIGNATURES)`. Decode both and compare:
+
+| | SHA-1 |
+|---|---|
+| UNIQUE's own signing key (`app/debug.keystore`) | `64:DB:A6:…:47:6B` |
+| what the SDK computed, on the phone, inside UNIQUE | `95:C1:BB:…:37:4A` |
+
+They are different, which means the SDK was handed **Standoff 2's own certificate**. It
+asked the app's own `PackageManager`, that is UNIQUE's virtual one, and UNIQUE answered
+with the guest's real signature — because it holds the guest's real APK.
+
+**That is the whole difference between Google and everyone else.** Google asks Play
+services, which is another process and resolves the caller by kernel uid, and UNIQUE has no
+part in that conversation. Facebook, VK, and every SDK that identifies its host app through
+the app's own `PackageManager` ask a question UNIQUE answers correctly today.
+
+So for this game the identity half of a Facebook login is already solved. What is not is the
+**return leg**, and the run shows precisely where it breaks:
+
+```
+FB.LoginWithReadPermissions({"scope":"public_profile,email"})
+  → FBUnityLoginActivity     routed onto a stub, launched
+  → FacebookActivity         routed, launched
+  → CustomTabMainActivity    routed, launched
+  → ACTIVITY_IMPLICIT_LEFT_GUEST action=VIEW data=https handledByHost=com.android.chrome
+```
+
+Three of the SDK's four activities ran inside the space. The fourth opened Chrome, and from
+there the redirect — `fb752573801798020://authorize/…` — is handed to
+`PackageManagerService`, which has never installed a package declaring that scheme. The
+sign-in completes on Facebook's side and arrives nowhere.
+
+### What closing it takes
+
+Keep the browser leg inside the guest's own process:
+
+1. Intercept the `ACTION_VIEW` for the authorize URL instead of letting it leave.
+2. Open it in a `WebView` in an activity UNIQUE owns, running in the guest's process, with
+   the guest's own cookie jar.
+3. Watch navigation for the redirect scheme the guest's manifest declares.
+4. Deliver it to the guest's own activity **directly**, as an `Intent`, never through
+   `PackageManagerService`.
+
+Nothing in that needs the host's PackageManager to know the guest exists, and nothing in it
+is blocked. It is the highest-value unbuilt piece in this engine: it is what a working login
+for Standoff 2 actually depends on, and it fixes the same wall for every app that signs in
+through a browser.
+
+It does **not** help Google sign-in, which never opens a browser.
+
+### The other half, which comes first
+
+Every auth request shape in Standoff 2's binary — `GoogleAuthRequest`, `VkAuthRequest`,
+`FacebookAuthRequest`, `GameCenterAuthRequest`, `TestAuthRequest` — carries the same
+`AppVerification` report (`docs/STANDOFF2.md`). So the virtual-space verdict is **not**
+specific to Google: a Facebook login would be refused by Axlebolt's server for the same
+reason a Google one would, if the report still says the APK lives under `com.unique`.
+
+The order therefore is not a preference, it is a dependency:
+
+1. Close the virtual-space verdict — `GuestIdentityPaths`, in progress, measured on the
+   next run.
+2. Then the in-space browser, which makes a Facebook or VK login able to complete.
+
+Doing the second first would produce a login that reaches the server and is refused, and
+nothing would be learned from it.
+
+---
+
+## 3b. The general shape of the browser problem
 
 Apps that sign in through the **browser** — AppAuth, Custom Tabs, an `ACTION_VIEW` to an
-authorize URL — fail for a completely different reason, and that one is fixable without
-GMS at all.
+authorize URL — all fail the same way, and that way is fixable without GMS at all.
 
 The sixth run settled the diagnosis: the outbound half works, and the **return** half
 cannot happen. The redirect is an `ACTION_VIEW` for `myapp://callback`, Chrome hands it to
@@ -122,8 +213,9 @@ The fix is to keep the whole exchange inside the guest's own process:
 Nothing in that needs the host's PackageManager to know the guest exists. It is a real
 piece of work and it is not blocked on anything.
 
-It does **not** help Standoff 2, which uses the native Google Sign-In API rather than a
-browser flow, and it does not help ChatGPT's device check.
+It does not help ChatGPT's device check, which is attestation rather than identity. It does
+not help Google sign-in from any app. It **does** help Standoff 2, through Facebook — see
+§3 — which is the finding that reorders this whole document.
 
 ---
 
@@ -141,6 +233,9 @@ Recorded so that each is not re-proposed:
 - **Patching the guest's APK to use a web OAuth client.** It changes `ApkHash`, which
   Standoff 2 sends in its `AppVerification` report, and the server has a message for
   exactly that: `FilesNotAuthenticMessage`.
+- **Assuming the Facebook route generalises to Google.** It does not, and the reason is
+  the table at the top: the two SDKs ask different processes. Nothing about §3 working
+  makes §2 any closer.
 
 ---
 

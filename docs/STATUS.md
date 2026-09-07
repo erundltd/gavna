@@ -1352,6 +1352,60 @@ looks like an app that is empty rather than one that crashes. The new
 `io_redirect: nothing in this process imports: …` names any symbol in the table that nothing
 spells that way. Either line would have named this run's bug on sight.
 
+### What the thirteenth run settled about signing in, found late
+
+Re-read for a different question, the thirteenth log answers one this project had been
+answering wrongly. The user tried Facebook login in Standoff 2, and the SDK printed the
+identity it had been given:
+
+```
+V com.facebook.unity.FB: Init({"appId":"752573801798020", …})
+D com.facebook.unity.FB: KeyHash: lcG7acvUIg0k4FQSQmAbyw1tN0o=
+```
+
+A Facebook key hash is `base64(SHA-1(signing certificate))`, computed at run time from
+`getPackageInfo(getPackageName(), GET_SIGNATURES)`. Decoded, that is
+`95:C1:BB:…:37:4A`. UNIQUE's own signing certificate is `64:DB:A6:…:47:6B`. They are
+different, so the SDK was handed **the guest's** certificate: it asked the app's own
+`PackageManager`, which is UNIQUE's virtual one, and got the right answer.
+
+**That is the distinction this project had been missing.** "A guest cannot prove who it is"
+was written as a property of virtualization. It is a property of *who is asked*:
+
+| The SDK asks | Resolves identity by | UNIQUE |
+|---|---|---|
+| Play services (another process) | kernel uid | cannot reach it |
+| the app's own `PackageManager` | the virtual one | **already correct** |
+
+Google is the first row. Facebook, VK and most SDKs are the second, and for them the
+identity half is solved today.
+
+What is not solved is the return leg, and the same log shows exactly where it stops. Three
+of the Facebook SDK's four activities ran inside the space — `FBUnityLoginActivity`,
+`FacebookActivity`, `CustomTabMainActivity`, each routed onto a stub and launched — and the
+fourth opened Chrome:
+
+```
+ACTIVITY_IMPLICIT_LEFT_GUEST action=android.intent.action.VIEW data=https
+    package=com.axlebolt.standoff2 handledByHost=com.android.chrome
+```
+
+From there the redirect `fb752573801798020://authorize/…` goes to
+`PackageManagerService`, which has never installed a package declaring that scheme. The
+sign-in completes on Facebook's side and arrives nowhere — the same wall the sixth run
+found for OAuth generally, now with a named app behind it.
+
+So the highest-value unbuilt piece in this engine is the in-space browser: intercept the
+authorize `ACTION_VIEW`, run it in a `WebView` in the guest's own process, watch for the
+guest's declared redirect scheme, and deliver it as an `Intent` directly. It is not blocked
+on anything.
+
+**It comes second, and that is a dependency rather than a preference.** Every auth request
+shape in Standoff 2's binary carries the same `AppVerification` report, so the virtual-space
+verdict refuses a Facebook login for exactly the reason it refuses a Google one. Closing the
+verdict first is what makes the browser work worth doing; doing it in the other order
+produces a login that reaches the server and is refused, and teaches nothing.
+
 ### What the sixth run settled about Google sign-in
 
 The Google layer used to answer `PASSTHROUGH` for `SIGN_IN` whenever an app declared an

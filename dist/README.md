@@ -114,10 +114,54 @@ unless the redirect is actually in place and the path actually opens.
 information — that is the design working — and *fails* on a published path that some caller
 could not open. That distinction is the whole lesson from your log.
 
+### Will the game ever actually work? — the short version
+
+Three different things have been getting mixed together, so, separately:
+
+1. **Запускается ли игра.** Да, уже. Твой одиннадцатый лог: Unity на настоящем GPU, свои
+   файлы, звук, экран входа на 2400×1080, твоё касание принято. Это не вопрос.
+2. **Табличка «виртуальное пространство».** Решаемая, и я знаю чем — четыре геттера, ничего
+   больше. Работа идёт; ни один лог ещё не мерил её под целой сборкой.
+3. **Вход.** Вот здесь было моё собственное заблуждение, и твой же лог его исправил.
+
+### Что нашлось в твоём логе про вход
+
+Ты пробовал войти через Facebook, и SDK напечатал, за кого он считает приложение:
+
+```
+D com.facebook.unity.FB: KeyHash: lcG7acvUIg0k4FQSQmAbyw1tN0o=
+```
+
+Это отпечаток **подписи приложения**, посчитанный на месте. У UNIQUE отпечаток другой
+(`ZNumr4jaGDnhpxdrLhZyrLkUR2s=`). Значит SDK получил **настоящую подпись Standoff 2** —
+он спросил PackageManager самого приложения, а это PackageManager UNIQUE, и тот ответил
+правильно.
+
+**Это и есть разница между Google и всеми остальными.** Google спрашивает Play services —
+другой процесс, который смотрит на идентификатор процесса ядра, и туда UNIQUE не дотянется
+никогда. Facebook, VK и почти все остальные спрашивают само приложение — и там UNIQUE уже
+отвечает верно, сегодня.
+
+Дальше лог показывает, где именно вход останавливается. Три из четырёх экранов Facebook
+SDK отработали **внутри** пространства, а четвёртый открыл Chrome — и оттуда возврат
+(`fb752573801798020://authorize/…`) уходит в Android, который не знает такого приложения.
+Вход завершается на стороне Facebook и приходит в никуда.
+
+Починить это — конкретная, ограниченная работа: перехватить открытие браузера, показать
+страницу входа в WebView **внутри процесса приложения**, дождаться возврата и отдать его
+приложению напрямую, минуя Android. Ничем не заблокировано.
+
+**Порядок важен и он не по вкусу, а по зависимости.** В бинарнике игры *каждый* вид входа —
+Google, VK, Facebook, Game Center — несёт с собой один и тот же отчёт об окружении. Значит
+сервер откажет и по Facebook, пока отчёт говорит, что APK лежит в папке `com.unique`.
+Сначала табличка, потом браузер внутри пространства. В обратном порядке получится вход,
+который дойдёт до сервера и будет отклонён, и из этого ничего не узнать.
+
 ### About Google sign-in, since you asked
 
 Short answer: **not through your phone's own Play services. Ever. And there is exactly one
-route that could work, which is not built yet.** The long answer is
+route that could work, which is not built yet — but per the section above, Google is not
+the route this game needs.** The long answer is
 [`docs/GOOGLE_SIGN_IN.md`](../docs/GOOGLE_SIGN_IN.md); the essentials:
 
 Google identifies an app by **package name and signing certificate**, and it does not take
